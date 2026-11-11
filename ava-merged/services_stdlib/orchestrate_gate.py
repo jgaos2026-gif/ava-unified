@@ -92,8 +92,10 @@ def _call_sb688_prebrain(intent_text):
             result = json.loads(raw.decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, ValueError, OSError):
         return {"ok": False, "detail": "SB688_RUNTIME_UNAVAILABLE_OR_INVALID"}
-    spine = result.get("spine") if isinstance(result, dict) else None
-    truth = result.get("truth") if isinstance(result, dict) else None
+    if not isinstance(result, dict):
+        return {"ok": False, "detail": "SB688_RUNTIME_RESPONSE_NOT_OBJECT"}
+    spine = result.get("spine")
+    truth = result.get("truth")
     verified = (
         result.get("ok") is True
         and isinstance(spine, dict)
