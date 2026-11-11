@@ -165,6 +165,14 @@ class RoomLedger:
         quarantined with the failed layer named, never silently
         accepted."""
         with self.lock:
+            # Re-read disk under the append lock. A cached startup result is not
+            # sufficient if the ledger was modified or corrupted after mount.
+            self.chain = self.verify_chain()
+            if not self.chain.get("ok"):
+                self._quarantine(envelope, "crypto", endpoint)
+                return {"ok": False, "certified": False,
+                        "state": "QUARANTINED", "failed_layer": "crypto",
+                        "endpoint": endpoint}
             certified, failed_layer = self.gate(envelope)
             if not certified:
                 self._quarantine(envelope, failed_layer, endpoint)
@@ -193,8 +201,15 @@ class RoomLedger:
                         "state": "QUARANTINED", "failed_layer": "audit",
                         "endpoint": endpoint, "error": str(e)}
             self.chain = self.verify_chain()
-            return {"ok": True, "certified": True,
-                    "state": "CERTIFIED",
+            if not self.chain.get("ok"):
+                # The write happened, so preserve it for forensic review, but
+                # never report a failed post-write integrity check as success.
+                self._quarantine(envelope, "audit", endpoint)
+                return {"ok": False, "certified": False,
+                        "state": "UNRESOLVED", "failed_layer": "audit",
+                        "endpoint": endpoint, "verification": self.chain}
+            return {"ok": True, "certified": False,
+                    "state": "APPENDED_UNCERTIFIED",
                     "entry_hash": entry["entry_hash"],
                     "endpoint": endpoint}
 
