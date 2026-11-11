@@ -22,10 +22,12 @@ verify; strict mode AVA_REQUIRE_AUTHENTICATED_SCOPES=true also
 requires one) and re-verifies the WARM history chain fresh from
 disk. A failing gate returns GATE_REFUSED and the brain is never
 called. The SB688 SpineGovernor / LiquidTruthNodeMesh (TypeScript)
-is NOT wired here — no Python spine/truth module exists in this
-repo, and the gate records spine_runtime NOT_WIRED honestly rather
-than faking an approval; wiring the real TS runtime is the
-follow-up. See services_stdlib/orchestrate_gate.py.
+is called by the pre-brain gate through the authenticated
+/api/truth/pre-brain service endpoint. The request is refused if
+SB688_RUNTIME_URL or SB688_GATE_SHARED_SECRET is missing, if the
+SB688 signing keys/replay store are not durable, if the service
+refuses, or if its response does not prove durable-key and Truth
+mesh verification. See services_stdlib/orchestrate_gate.py.
 
 Gemini wiring (2026-11-04, John's "Do it"): opt-in only. When a request
 sets use_llm=True, the orchestrator passes it to the brain, which
