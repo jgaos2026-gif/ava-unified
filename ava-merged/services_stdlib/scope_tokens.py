@@ -53,6 +53,32 @@ Env vars read (each *_FILE wins over the bare var when both are set):
   AVA_SCOPE_VERIFY_KEY_FILE  / AVA_SCOPE_VERIFY_KEY   (base64 raw Ed25519 pubkey)
   AVA_SCOPE_HMAC_KEY_FILE    / AVA_SCOPE_HMAC_KEY     (base64 or raw HMAC secret)
 
+Round-3 strict mode (Finding A, adversarial audit 2026-11-10):
+  AVA_REQUIRE_AUTHENTICATED_SCOPES=true turns OFF the "no token means
+  caller-declared scopes" behaviour. DEFAULT IS OFF: with the variable
+  unset (or anything but a truthy value) the store behaves exactly as
+  before — a call with no token is accepted with its declared scopes
+  and reported as `declared-untrusted`. With strict mode ON, a call
+  with no token is REFUSED at the identity layer, exactly like a
+  presented-but-invalid token: it is never downgraded to declared
+  scopes. Strict mode also fails VISIBLY when no scope key is
+  configured at all (see require_authenticated_scopes() /
+  HistoryStore construction): an operator must never mistake a
+  deployment that is operationally functional but unauthenticated
+  for a secured one. Strict mode is env-driven so a deployment opts
+  in explicitly; the default stays permissive for local development
+  only, and that default is a deliberate, documented choice — not an
+  accident. Truthy values: 1, true, yes, on (case-insensitive).
+
+Round-3 token hardening (same audit):
+  * Expiry boundary: a token is expired AT exp (now >= exp), not
+    after it (the old check, now > exp, let a token verify in its
+    expiry second).
+  * Base64url decoding is STRICT: only the base64url alphabet
+    [A-Za-z0-9_-], no padding, canonical re-encoding. The old
+    decoder silently discarded characters outside the alphabet and
+    accepted padding and non-canonical trailing bits.
+
 Stdlib only. No new secrets in any repo.
 """
 import base64
@@ -61,6 +87,7 @@ import hashlib
 import hmac as _hmac
 import json
 import os
+import re
 import secrets
 import time
 
@@ -99,10 +126,44 @@ def _b64url_e(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
+_B64URL_ALPHABET = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
 def _b64url_d(text: str) -> bytes:
+    """STRICT base64url decode (round 3). Rejects anything that is not
+    a canonical unpadded base64url string: characters outside
+    [A-Za-z0-9_-] (the old decoder silently discarded them), any "="
+    padding, a length that cannot occur (len % 4 == 1), and
+    non-canonical trailing bits (the decoded bytes must re-encode to
+    exactly the input). Raises ValueError on any of these."""
     if not isinstance(text, str) or not text:
         raise ValueError("empty base64url segment")
-    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+    if not _B64URL_ALPHABET.match(text):
+        raise ValueError("base64url segment has characters outside "
+                         "the base64url alphabet")
+    if len(text) % 4 == 1:
+        raise ValueError("base64url segment has an impossible length")
+    raw = base64.b64decode(text.translate(str.maketrans("-_", "+/"))
+                           + "=" * (-len(text) % 4), validate=True)
+    if _b64url_e(raw) != text:
+        raise ValueError("base64url segment is not canonically encoded")
+    return raw
+
+
+# -- strict mode (round 3, Finding A) ---------------------------------
+ENV_REQUIRE_AUTHENTICATED_SCOPES = "AVA_REQUIRE_AUTHENTICATED_SCOPES"
+_TRUTHY = ("1", "true", "yes", "on")
+
+
+def require_authenticated_scopes() -> bool:
+    """True when the deployment opts into authenticated-only scopes:
+    AVA_REQUIRE_AUTHENTICATED_SCOPES set to a truthy value (1/true/
+    yes/on, case-insensitive). DEFAULT FALSE — unset means the old
+    behaviour (declared scopes accepted, reported declared-untrusted).
+    The default is permissive for local development only; a production
+    deployment turns this on explicitly."""
+    return (os.environ.get(ENV_REQUIRE_AUTHENTICATED_SCOPES, "")
+            .strip().lower() in _TRUTHY)
 
 
 def _canonical(payload: dict) -> bytes:
@@ -204,6 +265,14 @@ class ScopeTokenAuthority:
     def can_issue(self) -> bool:
         return self.ed_seed is not None or self.hmac_key is not None
 
+    @property
+    def has_verifying_key(self) -> bool:
+        """True when this authority can verify at least one token
+        method (an Ed25519 public key, derived from a seed or given
+        directly, or an HMAC key). Strict mode refuses to run without
+        one — see resolve_scopes() / HistoryStore."""
+        return self.ed_pub is not None or self.hmac_key is not None
+
     def issue(self, scopes, subject="ava", ttl_seconds=DEFAULT_TTL_SECONDS):
         """Issue a signed scope token. Ed25519 when a signing seed is
         configured, else HMAC. Raises ScopeTokenError when no signing
@@ -281,7 +350,7 @@ class ScopeTokenAuthority:
         if not isinstance(iat, int) or not isinstance(exp, int):
             return _bad("token has no valid timestamps")
         now = int(time.time())
-        if now > exp:
+        if now >= exp:
             return _bad("token expired")
         if iat > now + _IAT_SKEW_SECONDS:
             return _bad("token not yet valid")
@@ -323,17 +392,43 @@ def verify_scope_token(token, authority=None, allowed_scopes=None):
 
 
 def resolve_scopes(scopes=None, scope_token=None, authority=None,
-                   allowed_scopes=None):
+                   allowed_scopes=None, require_authenticated=None):
     """Resolve the effective scopes for one history call.
     Returns (effective_scopes, scope_trust, refusal):
       * token presented and valid -> (token scopes, "authenticated", None)
       * token presented and invalid -> (None, "invalid-token", refusal dict)
-      * no token -> (declared scopes, "declared-untrusted", None)
+      * no token, default mode -> (declared scopes, "declared-untrusted", None)
+      * no token, STRICT mode -> (None, "missing-token", refusal dict)
     A presented-but-invalid token is never silently downgraded to the
-    declared scopes: that would hide a forgery attempt."""
+    declared scopes: that would hide a forgery attempt. In strict mode
+    (AVA_REQUIRE_AUTHENTICATED_SCOPES=true, or require_authenticated
+    True) a MISSING token is refused the same way — an unauthorized
+    caller must not be able to simply omit the token and declare
+    GOVERNANCE or EVIDENCE. In strict mode with no verifying key
+    configured at all, every call is refused with a visible error
+    naming the missing provisioning, so an operator never mistakes
+    an unauthenticated deployment for a secured one."""
+    if require_authenticated is None:
+        require_authenticated = require_authenticated_scopes()
     if scope_token is None:
-        return scopes, "declared-untrusted", None
-    report = verify_scope_token(scope_token, authority=authority,
+        if not require_authenticated:
+            return scopes, "declared-untrusted", None
+        return None, "missing-token", {
+            "ok": False, "state": "REFUSED",
+            "error": "authenticated scopes required "
+                     "(AVA_REQUIRE_AUTHENTICATED_SCOPES=true) and no "
+                     "scope token was presented",
+            "scope_trust": "missing-token"}
+    auth = authority or ScopeTokenAuthority.from_env()
+    if require_authenticated and not auth.has_verifying_key:
+        return None, "no-verifying-key", {
+            "ok": False, "state": "REFUSED",
+            "error": "authenticated scopes required but no scope "
+                     "verifying key is configured: provision "
+                     "AVA_SCOPE_SIGNING_KEY_FILE / AVA_SCOPE_VERIFY_KEY_FILE "
+                     "or AVA_SCOPE_HMAC_KEY_FILE (see scope_tokens.py)",
+            "scope_trust": "no-verifying-key"}
+    report = verify_scope_token(scope_token, authority=auth,
                                 allowed_scopes=allowed_scopes)
     if not report.get("ok"):
         return None, "invalid-token", {

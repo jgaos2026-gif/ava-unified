@@ -14,6 +14,19 @@ Fixes vs the pasted version:
 
 Endpoints: GET /health, POST /orchestrate, WS /telemetry.
 
+Pre-brain gates (round 3, Finding 03 — MANDATORY): /orchestrate
+passes every request through services_stdlib/orchestrate_gate
+run_pre_brain_gates() BEFORE the braid search and BEFORE the brain
+call. The gate checks the scope token (a presented token must
+verify; strict mode AVA_REQUIRE_AUTHENTICATED_SCOPES=true also
+requires one) and re-verifies the WARM history chain fresh from
+disk. A failing gate returns GATE_REFUSED and the brain is never
+called. The SB688 SpineGovernor / LiquidTruthNodeMesh (TypeScript)
+is NOT wired here — no Python spine/truth module exists in this
+repo, and the gate records spine_runtime NOT_WIRED honestly rather
+than faking an approval; wiring the real TS runtime is the
+follow-up. See services_stdlib/orchestrate_gate.py.
+
 Gemini wiring (2026-11-04, John's "Do it"): opt-in only. When a request
 sets use_llm=True, the orchestrator passes it to the brain, which
 returns a Gemini proposal in llm_proposal. The proposal is additive
@@ -29,16 +42,47 @@ import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
-app = FastAPI(title="AVA Sovereign Orchestrator (corrected)", version="2.2.0")
+try:
+    from services_stdlib import history_store as _history_store_mod
+    from services_stdlib import orchestrate_gate as _gate
+except Exception:  # noqa: BLE001 - plain-import layout fallback
+    _history_store_mod = None
+    _gate = None
+
+app = FastAPI(title="AVA Sovereign Orchestrator (corrected)", version="2.3.0")
 
 BRAID_URL = os.getenv("BRAID_URL", "http://127.0.0.1:8781")
 BRAIN_URL = os.getenv("BRAIN_URL", "http://127.0.0.1:8773")
+
+# The WARM history store the pre-brain gate verifies. Built lazily
+# (constructing it creates the WARM directory); a store that cannot
+# be built leaves the gate with no store, and the gate then refuses
+# every request (fail closed) instead of running ungated.
+_HISTORY_STORE = None
+_HISTORY_STORE_FAILED = False
+
+
+def _get_history_store():
+    global _HISTORY_STORE, _HISTORY_STORE_FAILED
+    if _HISTORY_STORE is not None:
+        return _HISTORY_STORE
+    if _HISTORY_STORE_FAILED or _history_store_mod is None:
+        return None
+    try:
+        _HISTORY_STORE = _history_store_mod.HistoryStore()
+    except Exception:
+        _HISTORY_STORE_FAILED = True
+        return None
+    return _HISTORY_STORE
 
 
 class AgentIntent(BaseModel):
     context_stream: str
     use_llm: bool = False
     llm_model: Optional[str] = None
+    # Signed scope token for the pre-brain gate (optional in default
+    # mode; required when AVA_REQUIRE_AUTHENTICATED_SCOPES=true).
+    scope_token: Optional[str] = None
 
 
 class ConnectionManager:
@@ -82,6 +126,23 @@ async def telemetry(ws: WebSocket):
 
 @app.post("/orchestrate")
 async def orchestrate(intent: AgentIntent):
+    # MANDATORY pre-brain gates (round 3, Finding 03). This runs
+    # BEFORE the braid search and BEFORE the brain call: a refused
+    # request never reaches the brain service. The gate module itself
+    # is stdlib-only; if it failed to import, refuse rather than run
+    # ungated.
+    if _gate is None:
+        return {"status": "GATE_REFUSED",
+                "error": "pre-brain gate unavailable: orchestrate_gate "
+                         "module did not load",
+                "gate": {"ok": False, "checks": {},
+                         "scope_trust": "unavailable"}}
+    gate = _gate.run_pre_brain_gates(
+        intent.context_stream, history_store=_get_history_store(),
+        scope_token=intent.scope_token)
+    if not gate["ok"]:
+        return {"status": "GATE_REFUSED", "error": gate["error"],
+                "gate": gate}
     context_memory = None
     async with httpx.AsyncClient(trust_env=False) as client:
         try:
@@ -127,7 +188,8 @@ async def orchestrate(intent: AgentIntent):
             "llm_proposal": llm_proposal,
             "llm_status": llm_status,
             "llm_model": llm_model,
-            "llm_provider": "gemini" if intent.use_llm else ""}
+            "llm_provider": "gemini" if intent.use_llm else "",
+            "pre_brain_gate": gate}
 
 
 if __name__ == "__main__":

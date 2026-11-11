@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -575,6 +576,315 @@ class TestOrganismHealth(unittest.TestCase):
             {"identity": {"name": "AVA"}})
         self.assertFalse(report["ok"])
         self.assertEqual(report["brain"]["state"], "LOCAL_MODEL_UNRESOLVED")
+
+
+class TestStrictScopes(unittest.TestCase):
+    """Round 3, Finding A: AVA_REQUIRE_AUTHENTICATED_SCOPES strict mode.
+    Default mode is unchanged (declared scopes accepted, reported
+    declared-untrusted); strict mode refuses a missing token at the
+    identity layer, and refuses to start without a verifying key."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ava_strict_test_")
+        self.auth = scope_tokens.ScopeTokenAuthority(
+            hmac_key=b"test-hmac-key-32-bytes-long!!")
+        self.token = self.auth.issue(["MEMORY", "GOVERNANCE"],
+                                     subject="ava-merged")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        os.environ.pop("AVA_REQUIRE_AUTHENTICATED_SCOPES", None)
+
+    def test_default_mode_unchanged_no_token_accepted(self):
+        store = history_store.HistoryStore(self.tmp)
+        self.assertFalse(store.require_authenticated_scopes)
+        r = store.append(thread_id="T1", cycle_id="C1",
+                         division="GOVERNANCE", role="user",
+                         text="no token, default mode",
+                         scopes=["GOVERNANCE"])
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["scope_trust"], "declared-untrusted")
+
+    def test_strict_mode_refuses_missing_token_on_append(self):
+        store = history_store.HistoryStore(
+            self.tmp, scope_authority=self.auth,
+            require_authenticated_scopes=True)
+        r = store.append(thread_id="T1", cycle_id="C1",
+                         division="GOVERNANCE", role="user",
+                         text="no token, strict mode",
+                         scopes=["GOVERNANCE"])
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["state"], "QUARANTINED")
+        self.assertEqual(r["failed_layer"], "identity")
+        self.assertEqual(r["scope_trust"], "missing-token")
+        self.assertIn("AVA_REQUIRE_AUTHENTICATED_SCOPES", r["error"])
+        self.assertEqual(store.verify_chain()["entries"], 0)
+
+    def test_strict_mode_refuses_missing_token_on_recall(self):
+        store = history_store.HistoryStore(
+            self.tmp, scope_authority=self.auth,
+            require_authenticated_scopes=True)
+        got = store.recall(division="MEMORY", scopes=["MEMORY"])
+        self.assertFalse(got["ok"])
+        self.assertEqual(got["state"], "REFUSED")
+        self.assertEqual(got["scope_trust"], "missing-token")
+
+    def test_strict_mode_accepts_valid_token(self):
+        store = history_store.HistoryStore(
+            self.tmp, scope_authority=self.auth,
+            require_authenticated_scopes=True)
+        r = store.append(thread_id="T1", cycle_id="C1",
+                         division="MEMORY", role="user", text="one",
+                         scopes=["EVIDENCE"], scope_token=self.token)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["scope_trust"], "authenticated")
+        got = store.recall(thread_id="T1", scope_token=self.token)
+        self.assertTrue(got["ok"])
+        self.assertEqual(got["scope_trust"], "authenticated")
+
+    def test_strict_mode_refuses_invalid_token(self):
+        store = history_store.HistoryStore(
+            self.tmp, scope_authority=self.auth,
+            require_authenticated_scopes=True)
+        forged = self.token[:-6] + "AAAAAA"
+        r = store.append(thread_id="T1", cycle_id="C1",
+                         division="MEMORY", role="user", text="one",
+                         scopes=["MEMORY"], scope_token=forged)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["failed_layer"], "identity")
+        self.assertEqual(r["scope_trust"], "invalid-token")
+
+    def test_strict_mode_from_env_var(self):
+        with mock.patch.dict(os.environ,
+                             {"AVA_REQUIRE_AUTHENTICATED_SCOPES": "true"}):
+            store = history_store.HistoryStore(
+                self.tmp, scope_authority=self.auth)
+        self.assertTrue(store.require_authenticated_scopes)
+        r = store.append(thread_id="T1", cycle_id="C1",
+                         division="MEMORY", role="user", text="one",
+                         scopes=["MEMORY"])
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["scope_trust"], "missing-token")
+
+    def test_strict_mode_env_false_means_default(self):
+        with mock.patch.dict(os.environ,
+                             {"AVA_REQUIRE_AUTHENTICATED_SCOPES": "false"}):
+            store = history_store.HistoryStore(
+                self.tmp, scope_authority=self.auth)
+        self.assertFalse(store.require_authenticated_scopes)
+
+    def test_strict_mode_without_key_refuses_to_start(self):
+        # No key anywhere in the environment: constructing a strict
+        # store must fail VISIBLY instead of running unauthenticated.
+        with mock.patch.dict(os.environ,
+                             {"AVA_REQUIRE_AUTHENTICATED_SCOPES": "true"},
+                             clear=True):
+            with self.assertRaises(scope_tokens.ScopeTokenError):
+                history_store.HistoryStore(self.tmp)
+
+    def test_strict_mode_starts_when_key_provisioned_via_env(self):
+        env = {"AVA_REQUIRE_AUTHENTICATED_SCOPES": "true",
+               "AVA_SCOPE_HMAC_KEY": "test-hmac-key-32-bytes-long!!"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            store = history_store.HistoryStore(self.tmp)
+        self.assertTrue(store.require_authenticated_scopes)
+
+    def test_strict_mode_token_without_verifying_key_is_visible(self):
+        # resolve_scopes directly: strict mode, a token presented, but
+        # no verifying key configured anywhere.
+        with mock.patch.dict(os.environ,
+                             {"AVA_REQUIRE_AUTHENTICATED_SCOPES": "true"},
+                             clear=True):
+            scopes, trust, refusal = scope_tokens.resolve_scopes(
+                ["MEMORY"], self.token, require_authenticated=True)
+        self.assertIsNone(scopes)
+        self.assertEqual(trust, "no-verifying-key")
+        self.assertIsNotNone(refusal)
+        self.assertIn("no scope verifying key", refusal["error"])
+
+
+class TestExpiryBoundary(unittest.TestCase):
+    """Round 3: a token is expired AT exp (now >= exp)."""
+
+    def setUp(self):
+        self.auth = scope_tokens.ScopeTokenAuthority(
+            hmac_key=b"test-hmac-key-32-bytes-long!!")
+
+    def test_token_expired_at_exp(self):
+        token = self.auth.issue(["MEMORY"], subject="ava-merged",
+                                ttl_seconds=60)
+        real_now = time.time()
+        with mock.patch.object(scope_tokens.time, "time",
+                               lambda: real_now + 60):
+            report = self.auth.verify(token)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["error"], "token expired")
+
+    def test_token_valid_one_second_before_exp(self):
+        token = self.auth.issue(["MEMORY"], subject="ava-merged",
+                                ttl_seconds=60)
+        real_now = time.time()
+        with mock.patch.object(scope_tokens.time, "time",
+                               lambda: real_now + 59):
+            report = self.auth.verify(token)
+        self.assertTrue(report["ok"])
+
+
+class TestStrictBase64url(unittest.TestCase):
+    """Round 3: base64url decoding is STRICT — alphabet only, no
+    padding, canonical re-encoding."""
+
+    def test_rejects_characters_outside_alphabet(self):
+        for bad in ("AB*CD", "AB+CD", "AB/CD", "ab cd", "AB=C", "A"):
+            with self.assertRaises(ValueError, msg=bad):
+                scope_tokens._b64url_d(bad)
+
+    def test_rejects_padding_and_noncanonical_bits(self):
+        for bad in ("QQ==", "QR==", "QS==", "QQ"):
+            # "QQ" decodes to b"A" but re-encodes as "QQ" — canonical,
+            # so it is accepted; the padded / non-canonical forms are not.
+            if bad == "QQ":
+                self.assertEqual(scope_tokens._b64url_d(bad), b"A")
+            else:
+                with self.assertRaises(ValueError, msg=bad):
+                    scope_tokens._b64url_d(bad)
+
+    def test_canonical_round_trip_still_works(self):
+        self.assertEqual(
+            scope_tokens._b64url_d(scope_tokens._b64url_e(b"\x00\xff\x10")),
+            b"\x00\xff\x10")
+
+    def test_token_with_padded_or_bad_segment_refused(self):
+        auth = scope_tokens.ScopeTokenAuthority(
+            hmac_key=b"test-hmac-key-32-bytes-long!!")
+        token = auth.issue(["MEMORY"], subject="ava-merged")
+        prefix, body, sig = token.split(".")
+        for bad in (prefix + "." + body + "==" + "." + sig,
+                    prefix + "." + body + "." + sig[:-2] + "*A"):
+            report = auth.verify(bad)
+            self.assertFalse(report["ok"], bad)
+            self.assertEqual(report["error"], "malformed token")
+
+
+class TestMultiProcessLocking(unittest.TestCase):
+    """Round 3, Finding C: two processes racing an append. The gate
+    is deliberately slowed in the worker so both processes are inside
+    verify+gate at once — without a cross-process lock both pass the
+    gate on the same head and fork the chain. With the lock, exactly
+    one successor wins and the loser fails closed."""
+
+    WORKER = (
+        "import sys, json, time, os\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from services_stdlib import history_store\n"
+        "s = history_store.HistoryStore(sys.argv[2])\n"
+        "_real_gate = history_store.HistoryStore.gate\n"
+        "def _slow_gate(self, entry, scopes):\n"
+        "    ok, layer = _real_gate(self, entry, scopes)\n"
+        "    time.sleep(0.3)\n"
+        "    return ok, layer\n"
+        "history_store.HistoryStore.gate = _slow_gate\n"
+        "open(sys.argv[4], 'a').close()\n"
+        "while not os.path.exists(sys.argv[5]):\n"
+        "    time.sleep(0.005)\n"
+        "r = s.append(thread_id='T', cycle_id='C' + sys.argv[3],\n"
+        "             division='MEMORY', role='user',\n"
+        "             text='racer ' + sys.argv[3], scopes=['MEMORY'])\n"
+        "print(json.dumps({'ok': r['ok'], 'state': r.get('state'),\n"
+        "                  'failed_layer': r.get('failed_layer')}))\n"
+    )
+
+    def _race(self, extra_env=None):
+        tmp = tempfile.mkdtemp(prefix="ava_race_test_")
+        worker = os.path.join(tmp, "racer.py")
+        with open(worker, "w") as f:
+            f.write(self.WORKER)
+        repo = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                            ".."))
+        go = os.path.join(tmp, "go")
+        env = dict(os.environ)
+        if extra_env:
+            env.update(extra_env)
+        procs = []
+        for n in ("1", "2"):
+            ready = os.path.join(tmp, "ready" + n)
+            procs.append(subprocess.Popen(
+                [sys.executable, worker, repo, tmp, n, ready, go],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=env))
+        try:
+            deadline = time.time() + 30
+            while not (os.path.exists(os.path.join(tmp, "ready1"))
+                       and os.path.exists(os.path.join(tmp, "ready2"))):
+                if time.time() > deadline:
+                    raise AssertionError("racers did not become ready")
+                time.sleep(0.005)
+            open(go, "w").close()
+            results = []
+            for p in procs:
+                out, err = p.communicate(timeout=30)
+                self.assertEqual(p.returncode, 0, err)
+                results.append(json.loads(out.strip()))
+            self.assertEqual(sorted(r["ok"] for r in results),
+                             [False, True])
+            loser = [r for r in results if not r["ok"]][0]
+            self.assertEqual(loser["state"], "QUARANTINED")
+            self.assertEqual(loser["failed_layer"], "crypto")
+            v = history_store.HistoryStore(tmp).verify_chain()
+            self.assertTrue(v["ok"], v)
+            self.assertEqual(v["entries"], 1)
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    p.kill()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_two_processes_racing_append_one_wins(self):
+        self._race()
+
+    def test_two_processes_racing_append_one_wins_fallback_lock(self):
+        # Same race with the O_EXCL lockfile fallback forced on.
+        self._race({"AVA_HISTORY_LOCK_FORCE_FALLBACK": "1"})
+
+    def test_recall_never_sees_a_torn_write(self):
+        # A writer appending in a loop while this process recalls in
+        # a loop: every recall must return complete, parseable entries
+        # (the shared lock keeps recall out of the writer's section).
+        tmp = tempfile.mkdtemp(prefix="ava_race_recall_test_")
+        worker = os.path.join(tmp, "writer.py")
+        with open(worker, "w") as f:
+            f.write(
+                "import sys, time\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "from services_stdlib import history_store\n"
+                "s = history_store.HistoryStore(sys.argv[2])\n"
+                "for i in range(15):\n"
+                "    s.append(thread_id='T', cycle_id='C%d' % i,\n"
+                "             division='MEMORY', role='user',\n"
+                "             text='entry %d' % i, scopes=['MEMORY'])\n"
+                "    time.sleep(0.01)\n")
+        repo = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                            ".."))
+        proc = subprocess.Popen([sys.executable, worker, repo, tmp],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        try:
+            store = history_store.HistoryStore(tmp)
+            for _ in range(30):
+                got = store.recall(scopes=["MEMORY"])
+                self.assertTrue(got["ok"], got)
+                for e in got["entries"]:
+                    self.assertIsInstance(e, dict)
+                    self.assertIn("entry_hash", e)
+                time.sleep(0.01)
+            _, err = proc.communicate(timeout=30)
+            self.assertEqual(proc.returncode, 0, err)
+            self.assertTrue(history_store.HistoryStore(tmp)
+                            .verify_chain()["ok"])
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
