@@ -18,18 +18,18 @@ this repo — nothing here is a stub that always passes):
      request: the brain must not reason on top of corrupted memory.
      No history store configured at all also refuses (fail closed).
 
-What the gate does NOT check (honest boundary):
-  The SB688 runtime's SpineGovernor + LiquidTruthNodeMesh are
-  TypeScript (sb688-public); NO Python spine/truth module exists in
-  this repo — grep for SpineGovernor / LiquidTruthNodeMesh in
-  ava-merged finds nothing callable. So this gate records
-  spine_runtime: "NOT_WIRED_TS_RUNTIME" and does NOT pretend to call
-  it. Wiring the real TS runtime (HTTP call to the SB688 truth
-  service, or a Python port) is the documented follow-up; until
-  then the gate's refusals come from the scope + chain checks above,
-  which are the checks this repo can actually perform. A gate that
-  claimed spine approval without calling the spine would be a fake
-  gate, and is worse than an honest NOT_WIRED.
+What the gate checks:
+  3. SB688 TypeScript SpineGovernor + LiquidTruthNodeMesh — the gate
+     makes an authenticated HTTPS service-to-service call to
+     /api/truth/pre-brain. SB688 signs a one-time permit with its
+     durable Ed25519 key, verifies it through the real Truth mesh,
+     and persists replay protection. Missing secrets, ephemeral keys,
+     missing replay storage, invalid responses, timeouts, and runtime
+     refusals all block the AVA brain call. The two services must be
+     configured with SB688_RUNTIME_URL and the same
+     SB688_GATE_SHARED_SECRET; SB688 also requires its signing-key
+     and replay-store environment settings.
+
 
 Stdlib only. The orchestrator (FastAPI) calls run_pre_brain_gates()
 at the top of its /orchestrate handler, before the braid search and
