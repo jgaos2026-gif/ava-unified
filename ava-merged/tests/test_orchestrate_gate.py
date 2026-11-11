@@ -45,10 +45,13 @@ class TestOrchestrateGate(unittest.TestCase):
         self.store.append(thread_id="T1", cycle_id="C1",
                           division="MEMORY", role="user", text="one",
                           scopes=["MEMORY"])
-        gate = orchestrate_gate.run_pre_brain_gates(
-            "hello", history_store=self.store)
+        with mock.patch.object(orchestrate_gate, "_call_sb688_prebrain",
+                                return_value={"ok": True, "detail": "SB688_DURABLE_SPINE_AND_TRUTH_VERIFIED"}):
+            gate = orchestrate_gate.run_pre_brain_gates(
+                "hello", history_store=self.store)
         self.assertTrue(gate["ok"], gate)
         self.assertEqual(gate["scope_trust"], "declared-untrusted")
+        self.assertTrue(gate["checks"]["spine_runtime"]["ok"])
         calls = []
         out = _brain_if_allowed(gate, calls)
         self.assertEqual(calls, ["brain"])
@@ -87,11 +90,17 @@ class TestOrchestrateGate(unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_valid_token_passes_as_authenticated(self):
-        gate = orchestrate_gate.run_pre_brain_gates(
-            "hello", history_store=self.store, scope_token=self.token,
-            authority=self.auth)
+        with mock.patch.object(orchestrate_gate, "_call_sb688_prebrain",
+                                return_value={"ok": True, "detail": "SB688_DURABLE_SPINE_AND_TRUTH_VERIFIED"}):
+            gate = orchestrate_gate.run_pre_brain_gates(
+                "hello", history_store=self.store, scope_token=self.token,
+                authority=self.auth)
         self.assertTrue(gate["ok"], gate)
         self.assertEqual(gate["scope_trust"], "authenticated")
+        calls = []
+        out = _brain_if_allowed(gate, calls)
+        self.assertEqual(calls, ["brain"])
+        self.assertEqual(out["status"], "COGNITIVE_CYCLE_RESOLVED")
 
     def test_strict_mode_missing_token_refuses(self):
         gate = orchestrate_gate.run_pre_brain_gates(
@@ -108,13 +117,30 @@ class TestOrchestrateGate(unittest.TestCase):
         self.assertFalse(gate["ok"])
         self.assertIn("history store", gate["error"])
 
-    def test_spine_runtime_is_honestly_not_wired(self):
-        # The gate must NOT claim a spine approval it never performed.
-        gate = orchestrate_gate.run_pre_brain_gates(
-            "hello", history_store=self.store)
-        self.assertTrue(gate["ok"], gate)
-        detail = gate["checks"]["spine_runtime"]["detail"]
-        self.assertIn("NOT_WIRED_TS_RUNTIME", detail)
+    def test_missing_sb688_runtime_configuration_fails_closed(self):
+        with mock.patch.dict(os.environ, {
+            "SB688_RUNTIME_URL": "", "SB688_GATE_SHARED_SECRET": ""
+        }, clear=False):
+            gate = orchestrate_gate.run_pre_brain_gates(
+                "hello", history_store=self.store)
+        self.assertFalse(gate["ok"], gate)
+        self.assertEqual(gate["checks"]["spine_runtime"]["detail"],
+                         "SB688_RUNTIME_NOT_CONFIGURED")
+        calls = []
+        out = _brain_if_allowed(gate, calls)
+        self.assertEqual(calls, [])
+        self.assertEqual(out["status"], "GATE_REFUSED")
+
+    def test_remote_spine_refusal_fails_closed(self):
+        with mock.patch.object(orchestrate_gate, "_call_sb688_prebrain",
+                               return_value={"ok": False, "detail": "SB688_SPINE_OR_TRUTH_REJECTED"}):
+            gate = orchestrate_gate.run_pre_brain_gates(
+                "hello", history_store=self.store)
+        self.assertFalse(gate["ok"])
+        self.assertIn("spine_runtime", gate["error"])
+        calls = []
+        _brain_if_allowed(gate, calls)
+        self.assertEqual(calls, [])
 
     def test_endpoint_wiring_gate_before_brain(self):
         # Static check (fastapi is not installed in this venv): the
