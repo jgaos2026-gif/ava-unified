@@ -66,12 +66,11 @@ def run_pre_brain_gates(intent_text, history_store=None, scope_token=None,
         "scope": {"ok": True, "detail": "no token presented"},
         "history_chain": {"ok": False, "detail": "no history store"},
         "spine_runtime": {
-            "ok": True,
-            "detail": "NOT_WIRED_TS_RUNTIME: no Python "
-                      "SpineGovernor/LiquidTruthNodeMesh module exists "
-                      "in this repo; the TS-runtime wiring is the "
-                      "follow-up (see module docstring). This check "
-                      "does not approve anything."},
+            "ok": False,
+            "detail": "NOT_WIRED_TS_RUNTIME: the real TypeScript "
+                      "SpineGovernor/LiquidTruthNodeMesh has not been "
+                      "called. Fail closed: this request cannot proceed "
+                      "to the brain until runtime integration is active."},
     }
     # 1. identity / scopes.
     if _scope_tokens is None:
@@ -107,6 +106,12 @@ def run_pre_brain_gates(intent_text, history_store=None, scope_token=None,
                 "error": "pre-brain gate refused (history_chain): "
                          "history chain does not verify (state=%s)"
                          % chain.get("state"),
+                "scope_trust": scope_trust}
+    if not checks["spine_runtime"]["ok"]:
+        return {"ok": False, "checks": checks,
+                "error": "pre-brain gate refused (spine_runtime): "
+                         "SB688 TypeScript runtime is not wired; brain "
+                         "execution is disabled until it is verified",
                 "scope_trust": scope_trust}
     return {"ok": True, "checks": checks, "error": None,
             "scope_trust": scope_trust}
