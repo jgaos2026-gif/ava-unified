@@ -89,3 +89,15 @@ recall/identity go through RPCs. Seed after applying: push the three proven
 mesh-talk entries (thread stitch-rumi-2026-11-05, cycle mesh-roundtrip-1)
 via the local mirror script (ava-merged/supabase_mirror.py seed) or the app
 server; they become the first three rows of the shared chain.
+
+## AVA unified memory — 002_append_memory_chain_check.sql (2026-11-10)
+Replaces `ava.append_memory` (CREATE OR REPLACE). The 001 version checked
+only that the new entry's previous hash matched the current head; 002
+verifies the whole existing chain first (via `ava.verify_memory_chain`
+from 001) and refuses the write if the chain does not verify — appending
+onto a broken chain would certify new entries on top of corruption.
+Apply after 001, in the Dashboard SQL editor. NOT yet applied to the live
+project — apply + verify with `ava_verify_memory_chain` after. (The local
+HistoryStore got the same rule in code the same day: re-verify fresh
+before every write, check the post-write re-verification before reporting
+success.)

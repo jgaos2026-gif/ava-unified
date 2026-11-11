@@ -162,7 +162,9 @@ class HistoryStore:
             return False, "schema"
         if not isinstance(entry.get("cycle_id"), str) or not entry["cycle_id"].strip():
             return False, "schema"
-        # 3. crypto — chain linkage is intact at mount.
+        # 3. crypto — chain linkage verified fresh at write time
+        # (append/append_existing re-verify before calling the gate);
+        # a broken chain refuses writes.
         if not self.chain.get("ok"):
             return False, "crypto"
         if entry.get("previous_hash") != self.last_hash():
@@ -208,6 +210,11 @@ class HistoryStore:
             "stage": "WARM",
         }
         with self.lock:
+            # Re-verify the chain fresh at write time: the cached
+            # mount-time result must not authorize a write onto a
+            # chain that was modified after mount. The gate's crypto
+            # layer refuses when this fresh check fails.
+            self.chain = self.verify_chain()
             certified, failed_layer = self.gate(entry, scopes)
             if not certified:
                 self._quarantine(entry, failed_layer, scopes)
@@ -226,7 +233,17 @@ class HistoryStore:
                 return {"ok": False, "certified": False,
                         "state": "QUARANTINED", "failed_layer": "audit",
                         "division": division, "error": str(e)}
+            # The post-write re-verification must pass before any
+            # success is reported. The entry is already in the file
+            # (append-only); a failed re-check means it is reported
+            # as failed, never certified, and the broken chain
+            # refuses further writes until repaired.
             self.chain = self.verify_chain()
+            if not self.chain.get("ok"):
+                self._quarantine(entry, "audit", scopes)
+                return {"ok": False, "certified": False,
+                        "state": "QUARANTINED", "failed_layer": "audit",
+                        "division": division, "chain": self.chain}
             return {"ok": True, "certified": True,
                     "state": "CERTIFIED", "entry_id": entry_id,
                     "entry_hash": entry["entry_hash"],
@@ -295,6 +312,9 @@ class HistoryStore:
                         "division": entry.get("division")}
             # Gate against the local chain (identity/schema/braid/
             # transaction; crypto linkage via previous_hash == local head).
+            # Re-verify fresh first: the cached mount-time result must
+            # not authorize a write onto a chain modified after mount.
+            self.chain = self.verify_chain()
             certified, failed_layer = self.gate(entry, scopes)
             if not certified:
                 self._quarantine(entry, failed_layer, scopes)
@@ -312,7 +332,15 @@ class HistoryStore:
                 return {"ok": False, "certified": False,
                         "state": "QUARANTINED", "failed_layer": "audit",
                         "division": entry.get("division"), "error": str(e)}
+            # The post-write re-verification must pass before any
+            # success is reported (same rule as append()).
             self.chain = self.verify_chain()
+            if not self.chain.get("ok"):
+                self._quarantine(entry, "audit", scopes)
+                return {"ok": False, "certified": False,
+                        "state": "QUARANTINED", "failed_layer": "audit",
+                        "division": entry.get("division"),
+                        "chain": self.chain}
             return {"ok": True, "certified": True,
                     "state": "CERTIFIED", "entry_id": entry["entry_id"],
                     "entry_hash": entry["entry_hash"],

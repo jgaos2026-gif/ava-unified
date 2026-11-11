@@ -99,6 +99,84 @@ class TestHistoryStore(unittest.TestCase):
         self.assertFalse(v["ok"])
         self.assertEqual(v["state"], "CHAIN_BREAK")
 
+    def _tamper_first_row_text(self):
+        path = os.path.join(self.tmp, "history.jsonl")
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        first = json.loads(lines[0])
+        first["text"] = "tampered"
+        lines[0] = json.dumps(first) + "\n"
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+
+    def test_append_refused_after_external_tamper(self):
+        # The fixed write path: a store mounted on a healthy chain,
+        # then an existing row modified externally, must refuse the
+        # next append instead of certifying on top of corruption.
+        self.store.append(thread_id="T1", cycle_id="C1",
+                          division="MEMORY", role="user", text="one",
+                          scopes=_scopes("MEMORY"))
+        self.store.append(thread_id="T1", cycle_id="C2",
+                          division="MEMORY", role="ava", text="two",
+                          scopes=_scopes("MEMORY"))
+        self._tamper_first_row_text()
+        r = self.store.append(thread_id="T1", cycle_id="C3",
+                              division="MEMORY", role="user", text="three",
+                              scopes=_scopes("MEMORY"))
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["certified"])
+        self.assertEqual(r["state"], "QUARANTINED")
+        self.assertEqual(r["failed_layer"], "crypto")
+        self.assertEqual(self.store.verify_chain()["entries"], 0)
+        # A fresh mount on the tampered file still refuses writes.
+        fresh = history_store.HistoryStore(self.tmp)
+        r2 = fresh.append(thread_id="T1", cycle_id="C4",
+                          division="MEMORY", role="user", text="four",
+                          scopes=_scopes("MEMORY"))
+        self.assertFalse(r2["ok"])
+        self.assertEqual(r2["failed_layer"], "crypto")
+
+    def test_append_refused_after_last_row_tamper(self):
+        # The stored-head case: tampering the last row must also
+        # refuse the next append, not link a new entry onto it.
+        self.store.append(thread_id="T1", cycle_id="C1",
+                          division="MEMORY", role="user", text="one",
+                          scopes=_scopes("MEMORY"))
+        path = os.path.join(self.tmp, "history.jsonl")
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        last = json.loads(lines[-1])
+        last["text"] = "tampered"
+        lines[-1] = json.dumps(last) + "\n"
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        r = self.store.append(thread_id="T1", cycle_id="C2",
+                              division="MEMORY", role="ava", text="two",
+                              scopes=_scopes("MEMORY"))
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["certified"])
+        self.assertEqual(r["failed_layer"], "crypto")
+
+    def test_append_existing_refused_after_external_tamper(self):
+        self.store.append(thread_id="T1", cycle_id="C1",
+                          division="MEMORY", role="user", text="one",
+                          scopes=_scopes("MEMORY"))
+        other_tmp = tempfile.mkdtemp(prefix="ava_history_other_")
+        try:
+            other = history_store.HistoryStore(other_tmp)
+            other.append(thread_id="T9", cycle_id="C9",
+                         division="MEMORY", role="user", text="other",
+                         scopes=_scopes("MEMORY"))
+            with open(os.path.join(other_tmp, "history.jsonl")) as f:
+                entry = json.loads(f.readline())
+        finally:
+            shutil.rmtree(other_tmp, ignore_errors=True)
+        self._tamper_first_row_text()
+        r = self.store.append_existing(entry, scopes=_scopes("MEMORY"))
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["certified"])
+        self.assertEqual(r["failed_layer"], "crypto")
+
     def test_divisions_are_the_six_bct_strands_awaiting_ruling(self):
         d = self.store.divisions()
         self.assertEqual(d["divisions"],
