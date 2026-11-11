@@ -35,6 +35,13 @@ Stdlib only. The orchestrator (FastAPI) calls run_pre_brain_gates()
 at the top of its /orchestrate handler, before the braid search and
 before the brain call, and returns GATE_REFUSED when it fails.
 """
+import json
+import os
+import uuid
+import urllib.error
+import urllib.request
+from urllib.parse import urlparse
+
 try:
     from services_stdlib import history_store as _history_store_mod
     from services_stdlib import scope_tokens as _scope_tokens
