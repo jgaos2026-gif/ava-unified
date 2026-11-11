@@ -201,8 +201,15 @@ class RoomLedger:
                         "state": "QUARANTINED", "failed_layer": "audit",
                         "endpoint": endpoint, "error": str(e)}
             self.chain = self.verify_chain()
-            return {"ok": True, "certified": True,
-                    "state": "CERTIFIED",
+            if not self.chain.get("ok"):
+                # The write happened, so preserve it for forensic review, but
+                # never report a failed post-write integrity check as success.
+                self._quarantine(envelope, "audit", endpoint)
+                return {"ok": False, "certified": False,
+                        "state": "UNRESOLVED", "failed_layer": "audit",
+                        "endpoint": endpoint, "verification": self.chain}
+            return {"ok": True, "certified": False,
+                    "state": "APPENDED_UNCERTIFIED",
                     "entry_hash": entry["entry_hash"],
                     "endpoint": endpoint}
 
