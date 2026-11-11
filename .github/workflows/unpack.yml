@@ -1,0 +1,25 @@
+name: Unpack AVA zip
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack the AVA zip into the repo root
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          unzip -o ava-unified-repo.zip
+          cp -a ava-unified-staging/. .
+          rm -rf ava-unified-staging ava-unified-repo.zip .github
+          git add -A
+          echo "--- files in tree ---"
+          git ls-files | wc -l
+          echo "--- status ---"
+          git status --porcelain
+          git commit -m "Upload AVA system (ava-unified tree, 207 files)"
+          git push
