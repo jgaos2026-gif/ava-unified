@@ -91,8 +91,13 @@ class TestOrchestrateGate(unittest.TestCase):
         gate = orchestrate_gate.run_pre_brain_gates(
             "hello", history_store=self.store, scope_token=self.token,
             authority=self.auth)
-        self.assertTrue(gate["ok"], gate)
+        self.assertFalse(gate["ok"], gate)
         self.assertEqual(gate["scope_trust"], "authenticated")
+        self.assertIn("spine_runtime", gate["error"])
+        calls = []
+        out = _brain_if_allowed(gate, calls)
+        self.assertEqual(calls, [])
+        self.assertEqual(out["status"], "GATE_REFUSED")
 
     def test_strict_mode_missing_token_refuses(self):
         gate = orchestrate_gate.run_pre_brain_gates(
