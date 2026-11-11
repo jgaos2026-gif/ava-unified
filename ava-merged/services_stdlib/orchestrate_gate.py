@@ -47,6 +47,61 @@ except Exception:  # noqa: BLE001 - plain-import layout fallback
         _scope_tokens = None
 
 
+def _call_sb688_prebrain(intent_text):
+    """Call the real SB688 SpineGovernor + LiquidTruthNodeMesh service.
+
+    The service-to-service credential is never sent to a non-HTTPS remote.
+    Missing configuration, malformed responses, timeouts, and every
+    non-200 status fail closed.
+    """
+    base_url = os.environ.get("SB688_RUNTIME_URL", "").rstrip("/")
+    shared_secret = os.environ.get("SB688_GATE_SHARED_SECRET", "")
+    if not base_url or len(shared_secret) < 32:
+        return {"ok": False, "detail": "SB688_RUNTIME_NOT_CONFIGURED"}
+    parsed = urlparse(base_url)
+    if parsed.scheme != "https" and parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+        return {"ok": False, "detail": "SB688_RUNTIME_REQUIRES_HTTPS"}
+    payload = json.dumps({
+        "id": "ava-" + uuid.uuid4().hex,
+        "text": intent_text,
+        "metadata": {"source": "ava-orchestrate"}
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        base_url + "/api/truth/pre-brain",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + shared_secret
+        },
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            if response.status != 200:
+                return {"ok": False, "detail": "SB688_RUNTIME_HTTP_%s" % response.status}
+            raw = response.read(65537)
+            if len(raw) > 65536:
+                return {"ok": False, "detail": "SB688_RUNTIME_RESPONSE_TOO_LARGE"}
+            result = json.loads(raw.decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+        return {"ok": False, "detail": "SB688_RUNTIME_UNAVAILABLE_OR_INVALID"}
+    spine = result.get("spine") if isinstance(result, dict) else None
+    truth = result.get("truth") if isinstance(result, dict) else None
+    verified = (
+        result.get("ok") is True
+        and isinstance(spine, dict)
+        and spine.get("approved") is True
+        and spine.get("keyProvenance") == "durable"
+        and isinstance(truth, dict)
+        and truth.get("verified") is True
+        and isinstance(truth.get("meshSignature"), str)
+        and bool(truth.get("meshSignature"))
+    )
+    if not verified:
+        return {"ok": False, "detail": "SB688_SPINE_OR_TRUTH_REJECTED"}
+    return {"ok": True, "detail": "SB688_DURABLE_SPINE_AND_TRUTH_VERIFIED"}
+
+
 class GateError(Exception):
     """The pre-brain gate refused the request. The message names the
     failing check; it never contains a token or a key."""
@@ -67,10 +122,7 @@ def run_pre_brain_gates(intent_text, history_store=None, scope_token=None,
         "history_chain": {"ok": False, "detail": "no history store"},
         "spine_runtime": {
             "ok": False,
-            "detail": "NOT_WIRED_TS_RUNTIME: the real TypeScript "
-                      "SpineGovernor/LiquidTruthNodeMesh has not been "
-                      "called. Fail closed: this request cannot proceed "
-                      "to the brain until runtime integration is active."},
+            "detail": "SB688 runtime pre-brain verification has not yet succeeded."},
     }
     # 1. identity / scopes.
     if _scope_tokens is None:
@@ -107,11 +159,15 @@ def run_pre_brain_gates(intent_text, history_store=None, scope_token=None,
                          "history chain does not verify (state=%s)"
                          % chain.get("state"),
                 "scope_trust": scope_trust}
+    spine_result = _call_sb688_prebrain(intent_text)
+    checks["spine_runtime"] = {
+        "ok": bool(spine_result.get("ok")),
+        "detail": spine_result.get("detail", "SB688 runtime returned no result")
+    }
     if not checks["spine_runtime"]["ok"]:
         return {"ok": False, "checks": checks,
                 "error": "pre-brain gate refused (spine_runtime): "
-                         "SB688 TypeScript runtime is not wired; brain "
-                         "execution is disabled until it is verified",
+                         "SB688 SpineGovernor/LiquidTruthNodeMesh did not verify",
                 "scope_trust": scope_trust}
     return {"ok": True, "checks": checks, "error": None,
             "scope_trust": scope_trust}
