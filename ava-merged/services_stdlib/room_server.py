@@ -29,9 +29,11 @@ False (no self-certification; hashes are not truth).
 """
 import hashlib
 import json
+import math
 import os
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -42,6 +44,11 @@ PACKAGE = os.path.dirname(ROOT)
 DEFAULT_DIR = os.path.join(PACKAGE, "vault_data")
 
 ENVELOPE_SCHEMA = "JGA-AVA-STITCH-ENVELOPE-1"
+MAX_REQUEST_BYTES = 1_048_576
+ALLOWED_ORIGINS = set(filter(None, os.environ.get(
+    "OASIS_ALLOWED_ORIGINS",
+    "http://127.0.0.1:8774,http://localhost:8774"
+).split(",")))
 
 LOCK = threading.RLock()
 
@@ -127,15 +134,27 @@ class RoomLedger:
             return False, "identity"
         if not isinstance(envelope.get("room"), str) or not envelope["room"].strip():
             return False, "identity"
-        # 2. schema — envelope shape, types, bounds.
+        # 2. schema — envelope shape, types, bounds, freshness and replay identity.
         if envelope.get("schema") != ENVELOPE_SCHEMA:
             return False, "schema"
-        if not isinstance(envelope.get("timestamp"), (int, float)):
+        timestamp = envelope.get("timestamp")
+        if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp):
             return False, "schema"
+        if abs(time.time() - timestamp) > 300:
+            return False, "freshness"
         if not isinstance(envelope.get("event_type"), str) or not envelope["event_type"].strip():
             return False, "schema"
         if "payload" not in envelope:
             return False, "schema"
+        if not isinstance(envelope.get("envelope_id"), str) or not envelope["envelope_id"].strip():
+            return False, "transaction"
+        nonce = envelope.get("nonce")
+        if not isinstance(nonce, str) or len(nonce) != 64:
+            return False, "transaction"
+        try:
+            int(nonce, 16)
+        except ValueError:
+            return False, "transaction"
         gov = envelope.get("governance")
         if not isinstance(gov, dict):
             return False, "schema"
@@ -151,11 +170,12 @@ class RoomLedger:
         if not envelope.get("event_type") or not envelope.get("room"):
             return False, "braid"
         # 5. transaction — envelope id unique when supplied.
-        env_id = envelope.get("envelope_id")
-        if env_id is not None:
-            for existing in self._read_entries():
-                if existing.get("envelope_id") == env_id:
-                    return False, "transaction"
+        env_id = envelope["envelope_id"]
+        nonce = envelope["nonce"]
+        for existing in self._read_entries():
+            prior = existing.get("envelope", {})
+            if prior.get("envelope_id") == env_id or prior.get("nonce") == nonce:
+                return False, "transaction"
         # 6. audit — pre-write shape only; durable append checked
         # by append() itself.
         return True, None
@@ -185,6 +205,8 @@ class RoomLedger:
                 "endpoint": endpoint,
                 "envelope": envelope,
                 "trust_state": "OBSERVED",
+                "identity_verified": False,
+                "signature_verified": False,
                 "self_certified": False,
                 "previous_hash": self.last_hash(),
                 "stage": "WARM",
@@ -227,16 +249,30 @@ class RoomLedger:
 LEDGER = RoomLedger()
 
 
+def origin_allowed(origin):
+    return not origin or origin in ALLOWED_ORIGINS
+
+
 def cors(h):
-    h.send_header("Access-Control-Allow-Origin", "*")
-    h.send_header("Access-Control-Allow-Headers", "Content-Type")
-    h.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+    origin = h.headers.get("Origin")
+    if origin and origin in ALLOWED_ORIGINS:
+        h.send_header("Access-Control-Allow-Origin", origin)
+        h.send_header("Vary", "Origin")
+        h.send_header("Access-Control-Allow-Headers", "Content-Type")
+        h.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
 
 
 def status_body(room):
-    return {"ok": True, "room": room, "state": "CONNECTED",
-            "service": "OASIS_ROOM_SERVER",
-            "ledger": LEDGER.verify_chain()}
+    chain = LEDGER.verify_chain()
+    return {
+        "ok": bool(chain.get("ok")),
+        "room": room,
+        "state": "LOCAL_SERVICE_READY" if chain.get("ok") else "UNRESOLVED",
+        "connected": False,
+        "certified": False,
+        "service": "OASIS_ROOM_SERVER",
+        "ledger": chain,
+    }
 
 
 class H(BaseHTTPRequestHandler):
@@ -253,13 +289,17 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(b)
 
     def body(self):
-        try:
-            n = int(self.headers.get("Content-Length", "0"))
-            return json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
-        except Exception:
-            return {}
+        n = int(self.headers.get("Content-Length", "0"))
+        if n < 0 or n > MAX_REQUEST_BYTES:
+            raise ValueError("request body exceeds the configured limit")
+        value = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+        if not isinstance(value, dict):
+            raise ValueError("request body must be a JSON object")
+        return value
 
     def do_OPTIONS(self):
+        if not origin_allowed(self.headers.get("Origin")):
+            return self.out({"error": "origin not allowed"}, 403)
         self.send_response(204)
         cors(self)
         self.end_headers()
@@ -282,13 +322,22 @@ class H(BaseHTTPRequestHandler):
         if path == "/api/room/sb688/status":
             return self.out(status_body("sb688"))
         if path == "/api/room/ledger/verify":
-            return self.out({"ok": True, "verification": LEDGER.verify_chain(),
-                             "certified": False})
+            verification = LEDGER.verify_chain()
+            valid = bool(verification.get("ok"))
+            return self.out({"ok": valid, "ledger_integrity_verified": valid,
+                             "envelope_verified": False, "certified": False,
+                             "verification": verification}, 200 if valid else 503)
         return self.out({"error": "not found"}, 404)
 
     def do_POST(self):
         path = urlparse(self.path).path
-        obj = self.body()
+        if not origin_allowed(self.headers.get("Origin")):
+            return self.out({"error": "origin not allowed"}, 403)
+        try:
+            obj = self.body()
+        except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
+            status = 413 if "limit" in str(exc) else 400
+            return self.out({"error": str(exc)}, status)
         if path == "/api/room/stitchbridge/verify":
             envelope = obj if isinstance(obj, dict) and obj.get("schema") else {
                 "schema": ENVELOPE_SCHEMA,
@@ -302,12 +351,16 @@ class H(BaseHTTPRequestHandler):
                                "preserve_failed_evidence": True},
             }
             chain = LEDGER.verify_chain()
-            return self.out({"ok": chain.get("ok", False),
-                             "verified": chain.get("ok", False),
-                             "certified": False,
-                             "state": "VERIFIED_BY_ROOM" if chain.get("ok") else "UNRESOLVED",
-                             "verification": chain,
-                             "envelope_schema": envelope.get("schema")})
+            valid = bool(chain.get("ok"))
+            return self.out({
+                "ok": valid,
+                "ledger_integrity_verified": valid,
+                "envelope_verified": False,
+                "certified": False,
+                "state": "LEDGER_INTEGRITY_VERIFIED" if valid else "UNRESOLVED",
+                "verification": chain,
+                "envelope_schema": envelope.get("schema"),
+            }, 200 if valid else 503)
         if path in ("/api/room/stitchbridge/event",
                     "/api/room/stitchbridge/cross",
                     "/api/room/ledger/append"):
