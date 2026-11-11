@@ -518,12 +518,13 @@ class TestRoomServer(unittest.TestCase):
         self.assertTrue(body["verified"])
         self.assertFalse(body["certified"])
 
-    def test_append_certified_then_malformed_quarantined(self):
+    def test_append_uncertified_then_malformed_quarantined(self):
         status, body = self._req("/api/room/ledger/append", method="POST",
                                  payload=self._envelope())
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
-        self.assertTrue(body["certified"])
+        self.assertFalse(body["certified"])
+        self.assertEqual(body["state"], "APPENDED_UNCERTIFIED")
         status, body = self._req("/api/room/ledger/append", method="POST",
                                  payload={"schema": "WRONG"})
         self.assertEqual(status, 422)
