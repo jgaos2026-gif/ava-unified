@@ -18,23 +18,30 @@ this repo — nothing here is a stub that always passes):
      request: the brain must not reason on top of corrupted memory.
      No history store configured at all also refuses (fail closed).
 
-What the gate does NOT check (honest boundary):
-  The SB688 runtime's SpineGovernor + LiquidTruthNodeMesh are
-  TypeScript (sb688-public); NO Python spine/truth module exists in
-  this repo — grep for SpineGovernor / LiquidTruthNodeMesh in
-  ava-merged finds nothing callable. So this gate records
-  spine_runtime: "NOT_WIRED_TS_RUNTIME" and does NOT pretend to call
-  it. Wiring the real TS runtime (HTTP call to the SB688 truth
-  service, or a Python port) is the documented follow-up; until
-  then the gate's refusals come from the scope + chain checks above,
-  which are the checks this repo can actually perform. A gate that
-  claimed spine approval without calling the spine would be a fake
-  gate, and is worse than an honest NOT_WIRED.
+What the gate checks:
+  3. SB688 TypeScript SpineGovernor + LiquidTruthNodeMesh — the gate
+     makes an authenticated HTTPS service-to-service call to
+     /api/truth/pre-brain. SB688 signs a one-time permit with its
+     durable Ed25519 key, verifies it through the real Truth mesh,
+     and persists replay protection. Missing secrets, ephemeral keys,
+     missing replay storage, invalid responses, timeouts, and runtime
+     refusals all block the AVA brain call. The two services must be
+     configured with SB688_RUNTIME_URL and the same
+     SB688_GATE_SHARED_SECRET; SB688 also requires its signing-key
+     and replay-store environment settings.
+
 
 Stdlib only. The orchestrator (FastAPI) calls run_pre_brain_gates()
 at the top of its /orchestrate handler, before the braid search and
 before the brain call, and returns GATE_REFUSED when it fails.
 """
+import json
+import os
+import uuid
+import urllib.error
+import urllib.request
+from urllib.parse import urlparse
+
 try:
     from services_stdlib import history_store as _history_store_mod
     from services_stdlib import scope_tokens as _scope_tokens
@@ -45,6 +52,63 @@ except Exception:  # noqa: BLE001 - plain-import layout fallback
     except Exception:  # noqa: BLE001 - gates unavailable, fail closed
         _history_store_mod = None
         _scope_tokens = None
+
+
+def _call_sb688_prebrain(intent_text):
+    """Call the real SB688 SpineGovernor + LiquidTruthNodeMesh service.
+
+    The service-to-service credential is never sent to a non-HTTPS remote.
+    Missing configuration, malformed responses, timeouts, and every
+    non-200 status fail closed.
+    """
+    base_url = os.environ.get("SB688_RUNTIME_URL", "").rstrip("/")
+    shared_secret = os.environ.get("SB688_GATE_SHARED_SECRET", "")
+    if not base_url or len(shared_secret) < 32:
+        return {"ok": False, "detail": "SB688_RUNTIME_NOT_CONFIGURED"}
+    parsed = urlparse(base_url)
+    if parsed.scheme != "https" and parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+        return {"ok": False, "detail": "SB688_RUNTIME_REQUIRES_HTTPS"}
+    payload = json.dumps({
+        "id": "ava-" + uuid.uuid4().hex,
+        "text": intent_text,
+        "metadata": {"source": "ava-orchestrate"}
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        base_url + "/api/truth/pre-brain",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + shared_secret
+        },
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            if response.status != 200:
+                return {"ok": False, "detail": "SB688_RUNTIME_HTTP_%s" % response.status}
+            raw = response.read(65537)
+            if len(raw) > 65536:
+                return {"ok": False, "detail": "SB688_RUNTIME_RESPONSE_TOO_LARGE"}
+            result = json.loads(raw.decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+        return {"ok": False, "detail": "SB688_RUNTIME_UNAVAILABLE_OR_INVALID"}
+    if not isinstance(result, dict):
+        return {"ok": False, "detail": "SB688_RUNTIME_RESPONSE_NOT_OBJECT"}
+    spine = result.get("spine")
+    truth = result.get("truth")
+    verified = (
+        result.get("ok") is True
+        and isinstance(spine, dict)
+        and spine.get("approved") is True
+        and spine.get("keyProvenance") == "durable"
+        and isinstance(truth, dict)
+        and truth.get("verified") is True
+        and isinstance(truth.get("meshSignature"), str)
+        and bool(truth.get("meshSignature"))
+    )
+    if not verified:
+        return {"ok": False, "detail": "SB688_SPINE_OR_TRUTH_REJECTED"}
+    return {"ok": True, "detail": "SB688_DURABLE_SPINE_AND_TRUTH_VERIFIED"}
 
 
 class GateError(Exception):
@@ -66,12 +130,8 @@ def run_pre_brain_gates(intent_text, history_store=None, scope_token=None,
         "scope": {"ok": True, "detail": "no token presented"},
         "history_chain": {"ok": False, "detail": "no history store"},
         "spine_runtime": {
-            "ok": True,
-            "detail": "NOT_WIRED_TS_RUNTIME: no Python "
-                      "SpineGovernor/LiquidTruthNodeMesh module exists "
-                      "in this repo; the TS-runtime wiring is the "
-                      "follow-up (see module docstring). This check "
-                      "does not approve anything."},
+            "ok": False,
+            "detail": "SB688 runtime pre-brain verification has not yet succeeded."},
     }
     # 1. identity / scopes.
     if _scope_tokens is None:
@@ -107,6 +167,16 @@ def run_pre_brain_gates(intent_text, history_store=None, scope_token=None,
                 "error": "pre-brain gate refused (history_chain): "
                          "history chain does not verify (state=%s)"
                          % chain.get("state"),
+                "scope_trust": scope_trust}
+    spine_result = _call_sb688_prebrain(intent_text)
+    checks["spine_runtime"] = {
+        "ok": bool(spine_result.get("ok")),
+        "detail": spine_result.get("detail", "SB688 runtime returned no result")
+    }
+    if not checks["spine_runtime"]["ok"]:
+        return {"ok": False, "checks": checks,
+                "error": "pre-brain gate refused (spine_runtime): "
+                         "SB688 SpineGovernor/LiquidTruthNodeMesh did not verify",
                 "scope_trust": scope_trust}
     return {"ok": True, "checks": checks, "error": None,
             "scope_trust": scope_trust}
