@@ -101,3 +101,19 @@ project — apply + verify with `ava_verify_memory_chain` after. (The local
 HistoryStore got the same rule in code the same day: re-verify fresh
 before every write, check the post-write re-verification before reporting
 success.)
+
+## AVA unified memory — 003_recall_memory_chain_check.sql (2026-11-10)
+Replaces `ava.recall_memory` (CREATE OR REPLACE). The 001 version served
+rows without checking the chain, so a caller could read (and the local
+mirror sync could pull) entries sitting on top of corruption; 003 calls
+`ava.verify_memory_chain` first (from 001) and refuses the read with
+`AVA_GATE_REFUSED layer=crypto` when the chain does not verify — fail
+closed, same refusal shape as the 002 append gate. The row-serving SELECT
+is byte-identical to 001; only the verification prologue and the plpgsql
+wrapper are new. The public wrapper `public.ava_recall_memory` needs no
+change (it calls `ava.recall_memory`). Apply after 001 and 002, in the
+Dashboard SQL editor. NOT yet applied to the live project — apply +
+verify with `ava_verify_memory_chain` after, and confirm a recall on a
+healthy chain still returns rows. (The local HistoryStore got the same
+rule in code the same day: recall re-verifies fresh from disk before
+serving, and serves only the verified prefix.)

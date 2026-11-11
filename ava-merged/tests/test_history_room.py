@@ -11,13 +11,16 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from services_stdlib import history_store  # noqa: E402
 from services_stdlib import room_server  # noqa: E402
+from services_stdlib import scope_tokens  # noqa: E402
 
 
 def _scopes(*divisions):
@@ -184,6 +187,282 @@ class TestHistoryStore(unittest.TestCase):
                           "EVIDENCE", "RECOVERY", "GOVERNANCE"])
         self.assertEqual(d["status"], "AWAITING_JOHNS_RULING")
         self.assertFalse(d["certified"])
+
+    def test_recall_reverifies_from_disk_after_mount(self):
+        # Finding 13: recall on the SAME store instance must re-verify
+        # the chain fresh from disk. A row tampered after mount must
+        # not be served on the strength of the mount-time check.
+        self.store.append(thread_id="T1", cycle_id="C1",
+                          division="MEMORY", role="user", text="one",
+                          scopes=_scopes("MEMORY"))
+        self.store.append(thread_id="T1", cycle_id="C2",
+                          division="MEMORY", role="ava", text="two",
+                          scopes=_scopes("MEMORY"))
+        self._tamper_first_row_text()
+        got = self.store.recall(thread_id="T1", scopes=_scopes("MEMORY"))
+        self.assertTrue(got["ok"])
+        self.assertEqual(got["entries"], [])
+        self.assertEqual(got["total_matching"], 0)
+        self.assertFalse(got["chain"]["ok"])
+        self.assertEqual(got["chain"]["state"], "HASH_FAILURE")
+        self.assertNotIn("TAMPERED", json.dumps(got["entries"]))
+
+    def test_recall_serves_verified_prefix_after_last_row_tamper(self):
+        # Finding 13, partial case: tampering only the last row serves
+        # the verified prefix (the first entry), not the tampered row.
+        self.store.append(thread_id="T1", cycle_id="C1",
+                          division="MEMORY", role="user", text="one",
+                          scopes=_scopes("MEMORY"))
+        self.store.append(thread_id="T1", cycle_id="C2",
+                          division="MEMORY", role="ava", text="two",
+                          scopes=_scopes("MEMORY"))
+        path = os.path.join(self.tmp, "history.jsonl")
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        last = json.loads(lines[-1])
+        last["text"] = "tampered"
+        lines[-1] = json.dumps(last) + "\n"
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        got = self.store.recall(thread_id="T1", scopes=_scopes("MEMORY"))
+        self.assertEqual(len(got["entries"]), 1)
+        self.assertEqual(got["entries"][0]["text"], "one")
+        self.assertEqual(got["total_matching"], 1)
+        self.assertFalse(got["chain"]["ok"])
+
+    def test_entry_id_recomputes_from_stored_timestamp(self):
+        # Finding 18: the entry_id must recompute from the stored
+        # timestamp and the other stored fields.
+        self.store.append(thread_id="T1", cycle_id="C1",
+                          division="MEMORY", role="user", text="one",
+                          scopes=_scopes("MEMORY"))
+        with open(os.path.join(self.tmp, "history.jsonl")) as f:
+            entry = json.loads(f.readline())
+        preimage = {"thread_id": entry["thread_id"],
+                    "cycle_id": entry["cycle_id"],
+                    "division": entry["division"],
+                    "role": entry["role"],
+                    "text": entry["text"],
+                    "timestamp": entry["timestamp"]}
+        self.assertEqual(
+            history_store._sha(history_store._canonical(preimage)),
+            entry["entry_id"])
+
+    def test_entry_id_recomputes_when_clock_ticks_between_reads(self):
+        # Finding 18, adversarial case: force the clock to tick between
+        # successive reads inside append(). With one clock read the id
+        # still recomputes; with two reads it would not.
+        calls = {"n": 0}
+
+        def ticking(fmt):
+            calls["n"] += 1
+            return "2026-11-10T00:00:0%d" % calls["n"]
+
+        with mock.patch.object(history_store.time, "strftime", ticking):
+            r = self.store.append(thread_id="T1", cycle_id="C1",
+                                  division="MEMORY", role="user", text="one",
+                                  scopes=_scopes("MEMORY"))
+        self.assertTrue(r["ok"])
+        with open(os.path.join(self.tmp, "history.jsonl")) as f:
+            entry = json.loads(f.readline())
+        preimage = {"thread_id": entry["thread_id"],
+                    "cycle_id": entry["cycle_id"],
+                    "division": entry["division"],
+                    "role": entry["role"],
+                    "text": entry["text"],
+                    "timestamp": entry["timestamp"]}
+        self.assertEqual(
+            history_store._sha(history_store._canonical(preimage)),
+            entry["entry_id"])
+
+    def test_append_reports_declared_scopes_untrusted(self):
+        # Finding 12: declared scopes keep working, but the result
+        # says so — "declared-untrusted", never "authenticated".
+        r = self.store.append(thread_id="T1", cycle_id="C1",
+                              division="MEMORY", role="user", text="one",
+                              scopes=_scopes("MEMORY"))
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["scope_trust"], "declared-untrusted")
+        got = self.store.recall(thread_id="T1", scopes=_scopes("MEMORY"))
+        self.assertEqual(got["scope_trust"], "declared-untrusted")
+
+
+class TestScopeTokens(unittest.TestCase):
+    """Finding 12: signed scope tokens (services_stdlib/scope_tokens.py).
+    Keys here are generated in-test and never touch disk."""
+
+    def setUp(self):
+        self.hmac_auth = scope_tokens.ScopeTokenAuthority(
+            hmac_key=b"test-hmac-key-32-bytes-long!!")
+        self.other_hmac_auth = scope_tokens.ScopeTokenAuthority(
+            hmac_key=b"different-key-32-bytes-long!!")
+
+    def test_hmac_issue_verify_round_trip(self):
+        token = self.hmac_auth.issue(["MEMORY", "GOVERNANCE"],
+                                     subject="ava-merged")
+        self.assertTrue(token.startswith("AVA1."))
+        self.assertEqual(len(token.split(".")), 3)
+        report = self.hmac_auth.verify(token)
+        self.assertTrue(report["ok"])
+        self.assertTrue(report["authenticated"])
+        self.assertEqual(report["method"], "hmac")
+        self.assertEqual(report["sub"], "ava-merged")
+        self.assertEqual(report["scopes"], ["GOVERNANCE", "MEMORY"])
+
+    def test_hmac_tampered_token_refused(self):
+        token = self.hmac_auth.issue(["MEMORY"], subject="ava-merged")
+        tampered = token[:-4] + "AAAA"
+        report = self.hmac_auth.verify(tampered)
+        self.assertFalse(report["ok"])
+        self.assertFalse(report["authenticated"])
+        self.assertIn("does not verify", report["error"])
+
+    def test_hmac_wrong_key_refused(self):
+        token = self.hmac_auth.issue(["MEMORY"], subject="ava-merged")
+        report = self.other_hmac_auth.verify(token)
+        self.assertFalse(report["ok"])
+
+    def test_hmac_expired_token_refused(self):
+        token = self.hmac_auth.issue(["MEMORY"], subject="ava-merged")
+        real_now = time.time()
+        with mock.patch.object(scope_tokens.time, "time",
+                               lambda: real_now + 7200):
+            report = self.hmac_auth.verify(token)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["error"], "token expired")
+
+    def test_hmac_unknown_scope_rejected_at_issue(self):
+        with self.assertRaises(scope_tokens.ScopeTokenError):
+            self.hmac_auth.issue(["FINANCE"], subject="ava-merged")
+
+    def test_verify_without_key_refused(self):
+        token = self.hmac_auth.issue(["MEMORY"], subject="ava-merged")
+        report = scope_tokens.ScopeTokenAuthority().verify(token)
+        self.assertFalse(report["ok"])
+        self.assertIn("no HMAC verifying key", report["error"])
+
+    def test_malformed_token_refused(self):
+        for bad in ("", "AVA1.", "AVA1.@@@.@@@", "not-a-token",
+                    "AVA1." + "x" * 10):
+            report = self.hmac_auth.verify(bad)
+            self.assertFalse(report["ok"], bad)
+
+    def test_ed25519_issue_verify_round_trip(self):
+        seed = scope_tokens.generate_ed25519_seed()
+        auth = scope_tokens.ScopeTokenAuthority(ed_seed=seed)
+        token = auth.issue(["MEMORY"], subject="ava-merged")
+        report = auth.verify(token)
+        self.assertTrue(report["ok"])
+        self.assertTrue(report["authenticated"])
+        self.assertEqual(report["method"], "ed25519")
+        self.assertEqual(report["scopes"], ["MEMORY"])
+        # A verifier holding only the public key verifies too.
+        pub_only = scope_tokens.ScopeTokenAuthority(ed_pub=auth.ed_pub)
+        self.assertTrue(pub_only.verify(token)["ok"])
+
+    def test_ed25519_tampered_refused(self):
+        seed = scope_tokens.generate_ed25519_seed()
+        auth = scope_tokens.ScopeTokenAuthority(ed_seed=seed)
+        token = auth.issue(["MEMORY"], subject="ava-merged")
+        report = auth.verify(token[:-4] + "AAAA")
+        self.assertFalse(report["ok"])
+        self.assertIn("does not verify", report["error"])
+
+    def test_issue_without_key_refused(self):
+        with self.assertRaises(scope_tokens.ScopeTokenError):
+            scope_tokens.ScopeTokenAuthority().issue(["MEMORY"])
+
+
+class TestHistoryStoreScopeTokens(unittest.TestCase):
+    """Finding 12: the history store gate verifies tokens; declared
+    scopes keep working but are reported untrusted."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ava_history_token_test_")
+        self.auth = scope_tokens.ScopeTokenAuthority(
+            hmac_key=b"test-hmac-key-32-bytes-long!!")
+        self.token = self.auth.issue(["MEMORY", "GOVERNANCE"],
+                                     subject="ava-merged")
+        self.store = history_store.HistoryStore(
+            self.tmp, scope_authority=self.auth)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_append_with_valid_token_is_authenticated(self):
+        r = self.store.append(thread_id="T1", cycle_id="C1",
+                              division="MEMORY", role="user", text="one",
+                              scopes=["EVIDENCE"], scope_token=self.token)
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["certified"])
+        self.assertEqual(r["scope_trust"], "authenticated")
+
+    def test_append_token_scopes_override_declared_scopes(self):
+        # The token's scopes are the effective scopes; the declared
+        # list is ignored when a valid token is presented.
+        r = self.store.append(thread_id="T1", cycle_id="C1",
+                              division="GOVERNANCE", role="user",
+                              text="gov", scopes=["EVIDENCE"],
+                              scope_token=self.token)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["scope_trust"], "authenticated")
+
+    def test_append_with_forged_token_refused_identity(self):
+        forged = self.token[:-6] + "AAAAAA"
+        r = self.store.append(thread_id="T1", cycle_id="C1",
+                              division="MEMORY", role="user", text="one",
+                              scopes=["MEMORY"], scope_token=forged)
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["certified"])
+        self.assertEqual(r["failed_layer"], "identity")
+        self.assertEqual(r["state"], "QUARANTINED")
+        self.assertEqual(r["scope_trust"], "invalid-token")
+        self.assertEqual(self.store.verify_chain()["entries"], 0)
+        # The forged token itself is never written to the quarantine file.
+        with open(os.path.join(self.tmp, "history_quarantine.jsonl")) as f:
+            record = json.loads(f.readline())
+        self.assertNotIn(forged, json.dumps(record))
+        self.assertEqual(record["scope_trust"], "invalid-token")
+
+    def test_recall_with_valid_token_is_authenticated(self):
+        self.store.append(thread_id="T1", cycle_id="C1",
+                          division="MEMORY", role="user", text="one",
+                          scopes=["MEMORY"], scope_token=self.token)
+        got = self.store.recall(thread_id="T1", scope_token=self.token)
+        self.assertTrue(got["ok"])
+        self.assertEqual(len(got["entries"]), 1)
+        self.assertEqual(got["scope_trust"], "authenticated")
+
+    def test_recall_with_forged_token_refused(self):
+        forged = self.token[:-6] + "AAAAAA"
+        got = self.store.recall(division="MEMORY", scope_token=forged)
+        self.assertFalse(got["ok"])
+        self.assertEqual(got["state"], "REFUSED")
+        self.assertEqual(got["scope_trust"], "invalid-token")
+
+    def test_recall_token_without_division_scope_refused(self):
+        memory_only = self.auth.issue(["MEMORY"], subject="ava-merged")
+        got = self.store.recall(division="GOVERNANCE",
+                                scope_token=memory_only)
+        self.assertFalse(got["ok"])
+        self.assertEqual(got["state"], "REFUSED")
+        self.assertEqual(got["scope_trust"], "authenticated")
+
+    def test_append_existing_with_valid_token_is_authenticated(self):
+        other_tmp = tempfile.mkdtemp(prefix="ava_history_other_")
+        try:
+            other = history_store.HistoryStore(other_tmp)
+            other.append(thread_id="T9", cycle_id="C9",
+                         division="MEMORY", role="user", text="other",
+                         scopes=_scopes("MEMORY"))
+            with open(os.path.join(other_tmp, "history.jsonl")) as f:
+                entry = json.loads(f.readline())
+        finally:
+            shutil.rmtree(other_tmp, ignore_errors=True)
+        r = self.store.append_existing(entry, scopes=["EVIDENCE"],
+                                       scope_token=self.token)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["scope_trust"], "authenticated")
 
 
 class TestRoomServer(unittest.TestCase):

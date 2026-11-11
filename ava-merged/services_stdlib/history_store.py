@@ -27,17 +27,34 @@ measured fact.
 
 Access: every history read/write names its division, and the caller
 declares the scopes it holds. A caller without that division's scope
-is refused with the division named. Honest limit: scopes here are a
-DECLARED claim carried in the request, not an authenticated token —
-there is no auth token system in this package yet. The scope check
-enforces the division boundary in code; it does not prove who the
-caller is. Real authenticated scopes are a future step.
+is refused with the division named. Scopes are authenticated by signed
+scope tokens (services_stdlib/scope_tokens.py): a call that presents a
+valid token is reported as `authenticated`; a call with caller-declared
+scopes only keeps working but is reported as `declared-untrusted` in
+its result. A presented token that does not verify is an identity-layer
+refusal, never a silent downgrade. Honest limit: a token authenticates
+the KEY HOLDER, not a human — which key belongs to which caller is the
+operator's provisioning step (env/keyfile, see scope_tokens.py), not
+done here. Until the operator provisions keys, every call is
+declared-untrusted and the division boundary is enforced in code only.
 """
 import hashlib
 import json
 import os
 import threading
 import time
+
+# Signed scope tokens (Finding 12). Optional import, same convention
+# as local_organism_core: if the module cannot load, the store still
+# runs and every presented token is refused while declared scopes keep
+# working as declared-untrusted.
+try:
+    from services_stdlib import scope_tokens as _scope_tokens
+except Exception:  # noqa: BLE001 - plain-import layout fallback
+    try:
+        import scope_tokens as _scope_tokens
+    except Exception:  # noqa: BLE001 - tokens unavailable, fail closed
+        _scope_tokens = None
 
 # --- Six divisions (definition choice, AWAITING JOHN'S RULING) ---
 DIVISIONS = (
@@ -72,7 +89,7 @@ def _canonical(obj):
 class HistoryStore:
     """WARM hash-chained history store. One store = one directory."""
 
-    def __init__(self, directory=None):
+    def __init__(self, directory=None, scope_authority=None):
         self.directory = directory or os.environ.get(
             "AVA_HISTORY_DIR", DEFAULT_DIR)
         os.makedirs(self.directory, exist_ok=True)
@@ -80,9 +97,34 @@ class HistoryStore:
         self.quarantine_path = os.path.join(
             self.directory, "history_quarantine.jsonl")
         self.lock = threading.RLock()
+        # Scope-token authority for this store. None means "build from
+        # the environment on each call" (scope_tokens default); pass an
+        # explicit ScopeTokenAuthority to pin keys (tests, embedding).
+        self.scope_authority = scope_authority
         # Full-chain verification on mount. If the chain is broken we
         # keep the verified prefix for reads and refuse writes.
         self.chain = self.verify_chain()
+
+    # -- scopes -------------------------------------------------------
+    def _resolve_scopes(self, scopes, scope_token):
+        """Resolve the effective scopes for one call.
+        Returns (effective_scopes, scope_trust, refusal):
+          * valid token -> (token scopes, "authenticated", None)
+          * invalid token -> (None, "invalid-token", refusal dict)
+          * no token -> (declared scopes, "declared-untrusted", None)
+        When the scope_tokens module failed to load, any presented
+        token is refused (fail closed); declared scopes still work."""
+        if scope_token is None:
+            return scopes, "declared-untrusted", None
+        if _scope_tokens is None:
+            return None, "invalid-token", {
+                "ok": False, "state": "REFUSED",
+                "error": "scope tokens unavailable: scope_tokens module "
+                         "not loaded",
+                "scope_trust": "invalid-token"}
+        return _scope_tokens.resolve_scopes(
+            scopes, scope_token, authority=self.scope_authority,
+            allowed_scopes=DIVISIONS)
 
     # -- chain ------------------------------------------------------
     def _read_entries(self):
@@ -186,18 +228,29 @@ class HistoryStore:
 
     # -- write --------------------------------------------------------
     def append(self, thread_id, cycle_id, division, role, text,
-               scopes, evidence_hash=None):
+               scopes, evidence_hash=None, scope_token=None):
         """Append one history entry. Returns a result dict. Only a
         CERTIFIED entry is stored; anything else is quarantined with
-        the failed layer named."""
+        the failed layer named. `scope_token` (optional) is a signed
+        scope token; a valid token reports scope_trust "authenticated",
+        declared scopes only report "declared-untrusted", and a
+        presented-but-invalid token is an identity-layer refusal.
+        The result always carries "scope_trust"."""
+        effective_scopes, scope_trust, refusal = self._resolve_scopes(
+            scopes, scope_token)
+        # ONE clock read for both the entry_id preimage and the entry
+        # timestamp (Finding 18): two reads could straddle a second
+        # boundary, and then the entry_id would not recompute from the
+        # stored timestamp.
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
         entry_id = _sha({
             "thread_id": thread_id, "cycle_id": cycle_id,
             "division": division, "role": role, "text": text,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "timestamp": timestamp,
         })
         entry = {
             "entry_id": entry_id,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "timestamp": timestamp,
             "thread_id": thread_id,
             "cycle_id": cycle_id,
             "division": division,
@@ -210,17 +263,23 @@ class HistoryStore:
             "stage": "WARM",
         }
         with self.lock:
+            if refusal is not None:
+                self._quarantine(entry, "identity", scopes, scope_trust)
+                return {"ok": False, "certified": False,
+                        "state": "QUARANTINED", "failed_layer": "identity",
+                        "division": division, "scope_trust": scope_trust,
+                        "error": refusal["error"]}
             # Re-verify the chain fresh at write time: the cached
             # mount-time result must not authorize a write onto a
             # chain that was modified after mount. The gate's crypto
             # layer refuses when this fresh check fails.
             self.chain = self.verify_chain()
-            certified, failed_layer = self.gate(entry, scopes)
+            certified, failed_layer = self.gate(entry, effective_scopes)
             if not certified:
-                self._quarantine(entry, failed_layer, scopes)
+                self._quarantine(entry, failed_layer, scopes, scope_trust)
                 return {"ok": False, "certified": False,
                         "state": "QUARANTINED", "failed_layer": failed_layer,
-                        "division": division}
+                        "division": division, "scope_trust": scope_trust}
             # Audit layer: the durable append itself.
             try:
                 entry["entry_hash"] = _sha(_canonical(entry))
@@ -229,10 +288,11 @@ class HistoryStore:
                     f.flush()
                     os.fsync(f.fileno())
             except Exception as e:  # noqa: BLE001
-                self._quarantine(entry, "audit", scopes)
+                self._quarantine(entry, "audit", scopes, scope_trust)
                 return {"ok": False, "certified": False,
                         "state": "QUARANTINED", "failed_layer": "audit",
-                        "division": division, "error": str(e)}
+                        "division": division, "scope_trust": scope_trust,
+                        "error": str(e)}
             # The post-write re-verification must pass before any
             # success is reported. The entry is already in the file
             # (append-only); a failed re-check means it is reported
@@ -240,16 +300,17 @@ class HistoryStore:
             # refuses further writes until repaired.
             self.chain = self.verify_chain()
             if not self.chain.get("ok"):
-                self._quarantine(entry, "audit", scopes)
+                self._quarantine(entry, "audit", scopes, scope_trust)
                 return {"ok": False, "certified": False,
                         "state": "QUARANTINED", "failed_layer": "audit",
-                        "division": division, "chain": self.chain}
+                        "division": division, "scope_trust": scope_trust,
+                        "chain": self.chain}
             return {"ok": True, "certified": True,
                     "state": "CERTIFIED", "entry_id": entry_id,
                     "entry_hash": entry["entry_hash"],
-                    "division": division}
+                    "division": division, "scope_trust": scope_trust}
 
-    def append_existing(self, entry, scopes):
+    def append_existing(self, entry, scopes, scope_token=None):
         """Append a complete, already-formed entry VERBATIM (mirror/sync path).
         Used when an entry already exists in the shared Supabase chain (or in
         another store) and the local store must hold the SAME entry — same
@@ -261,7 +322,11 @@ class HistoryStore:
         `timestamp` and extra columns (seq, created_at, source); those are
         normalized away here — the stored local entry holds exactly the
         twelve canonical keys plus entry_hash, byte-identical in content
-        to the entry as originally formed."""
+        to the entry as originally formed. `scope_token` is a signed
+        scope token; see append(). The result always carries
+        "scope_trust"."""
+        effective_scopes, scope_trust, refusal = self._resolve_scopes(
+            scopes, scope_token)
         canonical_keys = (
             "entry_id", "timestamp", "thread_id", "cycle_id", "division",
             "role", "text", "evidence_hash", "trust_state",
@@ -284,6 +349,13 @@ class HistoryStore:
             normalized["stage"] = "WARM"
         entry = normalized
         with self.lock:
+            if refusal is not None:
+                self._quarantine(entry, "identity", scopes, scope_trust)
+                return {"ok": False, "certified": False,
+                        "state": "QUARANTINED", "failed_layer": "identity",
+                        "division": entry.get("division"),
+                        "scope_trust": scope_trust,
+                        "error": refusal["error"]}
             # Crypto layer, full: recompute both hashes from the fields.
             try:
                 id_preimage = {
@@ -295,32 +367,36 @@ class HistoryStore:
                     "timestamp": entry["timestamp"],
                 }
                 if _sha(_canonical(id_preimage)) != entry.get("entry_id"):
-                    self._quarantine(entry, "crypto", scopes)
+                    self._quarantine(entry, "crypto", scopes, scope_trust)
                     return {"ok": False, "certified": False,
                             "state": "QUARANTINED", "failed_layer": "crypto",
-                            "division": entry.get("division")}
+                            "division": entry.get("division"),
+                            "scope_trust": scope_trust}
                 stored = {k: v for k, v in entry.items() if k != "entry_hash"}
                 if _sha(_canonical(stored)) != given_hash:
-                    self._quarantine(entry, "crypto", scopes)
+                    self._quarantine(entry, "crypto", scopes, scope_trust)
                     return {"ok": False, "certified": False,
                             "state": "QUARANTINED", "failed_layer": "crypto",
-                            "division": entry.get("division")}
+                            "division": entry.get("division"),
+                            "scope_trust": scope_trust}
             except (KeyError, TypeError):
-                self._quarantine(entry, "schema", scopes)
+                self._quarantine(entry, "schema", scopes, scope_trust)
                 return {"ok": False, "certified": False,
                         "state": "QUARANTINED", "failed_layer": "schema",
-                        "division": entry.get("division")}
+                        "division": entry.get("division"),
+                        "scope_trust": scope_trust}
             # Gate against the local chain (identity/schema/braid/
             # transaction; crypto linkage via previous_hash == local head).
             # Re-verify fresh first: the cached mount-time result must
             # not authorize a write onto a chain modified after mount.
             self.chain = self.verify_chain()
-            certified, failed_layer = self.gate(entry, scopes)
+            certified, failed_layer = self.gate(entry, effective_scopes)
             if not certified:
-                self._quarantine(entry, failed_layer, scopes)
+                self._quarantine(entry, failed_layer, scopes, scope_trust)
                 return {"ok": False, "certified": False,
                         "state": "QUARANTINED", "failed_layer": failed_layer,
-                        "division": entry.get("division")}
+                        "division": entry.get("division"),
+                        "scope_trust": scope_trust}
             try:
                 entry["entry_hash"] = _sha(_canonical(stored))
                 with open(self.path, "a", encoding="utf-8") as f:
@@ -328,23 +404,26 @@ class HistoryStore:
                     f.flush()
                     os.fsync(f.fileno())
             except Exception as e:  # noqa: BLE001
-                self._quarantine(entry, "audit", scopes)
+                self._quarantine(entry, "audit", scopes, scope_trust)
                 return {"ok": False, "certified": False,
                         "state": "QUARANTINED", "failed_layer": "audit",
-                        "division": entry.get("division"), "error": str(e)}
+                        "division": entry.get("division"),
+                        "scope_trust": scope_trust, "error": str(e)}
             # The post-write re-verification must pass before any
             # success is reported (same rule as append()).
             self.chain = self.verify_chain()
             if not self.chain.get("ok"):
-                self._quarantine(entry, "audit", scopes)
+                self._quarantine(entry, "audit", scopes, scope_trust)
                 return {"ok": False, "certified": False,
                         "state": "QUARANTINED", "failed_layer": "audit",
                         "division": entry.get("division"),
+                        "scope_trust": scope_trust,
                         "chain": self.chain}
             return {"ok": True, "certified": True,
                     "state": "CERTIFIED", "entry_id": entry["entry_id"],
                     "entry_hash": entry["entry_hash"],
-                    "division": entry.get("division")}
+                    "division": entry.get("division"),
+                    "scope_trust": scope_trust}
 
     def record_reflex_escalation(self, cycle_id, reason, fault_type,
                                   seq=-1, fault_id=""):
@@ -367,11 +446,16 @@ class HistoryStore:
             role="system", text=text, scopes=["GOVERNANCE"],
             evidence_hash=None)
 
-    def _quarantine(self, entry, failed_layer, scopes):
+    def _quarantine(self, entry, failed_layer, scopes,
+                    scope_trust="declared-untrusted"):
         record = dict(entry)
         record["quarantined"] = True
         record["failed_layer"] = failed_layer
         record["scopes_declared"] = scopes
+        # The trust of the scopes behind the refused call. The token
+        # itself is NEVER recorded here: a valid token is a bearer
+        # credential and must not land in a file.
+        record["scope_trust"] = scope_trust
         try:
             with open(self.quarantine_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -380,24 +464,40 @@ class HistoryStore:
 
     # -- read ---------------------------------------------------------
     def recall(self, thread_id=None, cycle_id=None, division=None,
-               scopes=None, limit=20):
+               scopes=None, limit=20, scope_token=None):
         """Recall entries by thread/cycle/division, newest last,
         capped at `limit`. The requested division must be in scope;
-        otherwise refused with the division named."""
+        otherwise refused with the division named. The chain is
+        re-verified FRESH from disk before serving (Finding 13): the
+        cached mount-time result must not authorize serving rows that
+        were tampered with after mount. Only the verified prefix is
+        served; the chain report in the result names the break.
+        `scope_token` is a signed scope token; see append(). The
+        result always carries "scope_trust"."""
+        effective_scopes, scope_trust, refusal = self._resolve_scopes(
+            scopes, scope_token)
+        if refusal is not None:
+            return dict(refusal, division=division)
         if division is not None and division not in DIVISIONS:
             return {"ok": False, "state": "REFUSED",
                     "error": "unknown division: %s" % division,
-                    "division": division}
+                    "division": division, "scope_trust": scope_trust}
         if division is not None:
-            if not isinstance(scopes, list) or division not in scopes:
+            if not isinstance(effective_scopes, list) \
+                    or division not in effective_scopes:
                 return {"ok": False, "state": "REFUSED",
                         "error": "scope for division %s not held" % division,
-                        "division": division}
+                        "division": division, "scope_trust": scope_trust}
         try:
             limit = max(1, min(int(limit), 100))
         except Exception:
             limit = 20
-        entries = self._read_entries()
+        with self.lock:
+            # Fresh re-verification from disk at recall time (Finding
+            # 13). A row tampered after mount must not be served on
+            # the strength of the mount-time check.
+            self.chain = self.verify_chain()
+            entries = self._read_entries()
         # Reads return the verified prefix only: stop at the first
         # entry past the verified count when the chain is broken.
         if not self.chain.get("ok"):
@@ -413,7 +513,8 @@ class HistoryStore:
             out.append(e)
         return {"ok": True, "entries": out[-limit:],
                 "total_matching": len(out),
-                "chain": self.chain, "certified": False}
+                "chain": self.chain, "certified": False,
+                "scope_trust": scope_trust}
 
     def divisions(self):
         return {"divisions": list(DIVISIONS),
