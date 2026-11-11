@@ -47,12 +47,13 @@ class TestOrchestrateGate(unittest.TestCase):
                           scopes=["MEMORY"])
         gate = orchestrate_gate.run_pre_brain_gates(
             "hello", history_store=self.store)
-        self.assertTrue(gate["ok"], gate)
+        self.assertFalse(gate["ok"], gate)
         self.assertEqual(gate["scope_trust"], "declared-untrusted")
+        self.assertIn("spine_runtime", gate["error"])
         calls = []
         out = _brain_if_allowed(gate, calls)
-        self.assertEqual(calls, ["brain"])
-        self.assertEqual(out["status"], "COGNITIVE_CYCLE_RESOLVED")
+        self.assertEqual(calls, [])
+        self.assertEqual(out["status"], "GATE_REFUSED")
 
     def test_broken_chain_refuses_and_brain_never_called(self):
         self.store.append(thread_id="T1", cycle_id="C1",
@@ -112,9 +113,14 @@ class TestOrchestrateGate(unittest.TestCase):
         # The gate must NOT claim a spine approval it never performed.
         gate = orchestrate_gate.run_pre_brain_gates(
             "hello", history_store=self.store)
-        self.assertTrue(gate["ok"], gate)
+        self.assertFalse(gate["ok"], gate)
         detail = gate["checks"]["spine_runtime"]["detail"]
         self.assertIn("NOT_WIRED_TS_RUNTIME", detail)
+        self.assertIn("spine_runtime", gate["error"])
+        calls = []
+        out = _brain_if_allowed(gate, calls)
+        self.assertEqual(calls, [])
+        self.assertEqual(out["status"], "GATE_REFUSED")
 
     def test_endpoint_wiring_gate_before_brain(self):
         # Static check (fastapi is not installed in this venv): the
