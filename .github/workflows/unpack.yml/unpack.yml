@@ -1,0 +1,34 @@
+name: Unpack push-ava-unified zip
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack the fix zip and commit the resulting tree
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          unzip -l push-ava-unified.zip
+          unzip -o push-ava-unified.zip
+          WRAPPER=$(unzip -Z1 push-ava-unified.zip | cut -d/ -f1 | sort -u)
+          if [ "$(printf '%s\n' "$WRAPPER" | wc -l)" -eq 1 ]; then
+            if [ -d "$WRAPPER/ava-merged" ] || [ -d "$WRAPPER/supabase" ]; then
+              cp -a "$WRAPPER"/. .
+              rm -rf "$WRAPPER"
+            fi
+          fi
+          rm -f push-ava-unified.zip
+          rm -f .github/workflows/unpack.yml
+          git add -A
+          echo "--- staged changes ---"
+          git status --porcelain
+          git diff --cached --name-only
+          [ "$(git diff --cached --name-only | wc -l)" -eq 6 ] || { echo "Unexpected number of staged files"; exit 1; }
+          for f in ava-merged/services_stdlib/history_store.py ava-merged/tests/test_history_room.py supabase/002_append_memory_chain_check.sql supabase/APPLY_ORDER.md push-ava-unified.zip .github/workflows/unpack.yml; do git diff --cached --name-only | grep -qx "$f" || { echo "Missing expected staged file: $f"; exit 1; }; done
+          git commit -m "Fix HistoryStore to fail closed on chain verification (Finding 01)"
+          git push
