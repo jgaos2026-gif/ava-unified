@@ -1,0 +1,28 @@
+name: ava-nextgen-sovereign-core
+
+services:
+  agent_matrix_runtime:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ava_nextgen_runtime_container
+    network_mode: "host"
+    environment:
+      # Passed through from the host environment / .env file.
+      # NEVER write a literal hash here. If unset, the vault locks.
+      - AVA_VAULT_PIN_HASH=${AVA_VAULT_PIN_HASH}
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://127.0.0.1:11434}
+      - AVA_LLM_MODEL=${AVA_LLM_MODEL:-llama3}
+      - VAULT_DATA_DIR=/app/vault_data
+    volumes:
+      - vault_storage:/app/vault_data
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "25m"
+        max-file: "5"
+
+volumes:
+  vault_storage:
+    driver: local

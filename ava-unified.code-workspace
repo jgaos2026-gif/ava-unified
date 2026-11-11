@@ -1,0 +1,1 @@
+{"extensions":{"recommendations":["ms-python.python"]},"folders":[{"path":"ava-merged"},{"path":"ava-hybrid"},{"path":"ava-advanced"},{"path":"ava-sector-brain"},{"path":"ava-reflex-sim"},{"path":"ava-sovereign"},{"path":"supabase"},{"path":"docs"}],"settings":{"python.testing.pytestArgs":["tests"],"python.testing.pytestEnabled":true}}

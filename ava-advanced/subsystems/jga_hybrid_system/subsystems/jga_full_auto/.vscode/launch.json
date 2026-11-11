@@ -1,0 +1,1 @@
+{"configurations":[{"args":["--demo"],"console":"integratedTerminal","name":"Demo pipeline","program":"${workspaceFolder}/main.py","request":"launch","type":"debugpy"},{"args":["--gates"],"console":"integratedTerminal","name":"Gates report","program":"${workspaceFolder}/main.py","request":"launch","type":"debugpy"}],"version":"0.2.0"}

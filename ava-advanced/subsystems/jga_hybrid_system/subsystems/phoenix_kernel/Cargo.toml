@@ -1,0 +1,12 @@
+[package]
+name = "bct_phoenix_kernel"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+description = "Bounded exact braid-action verification and Phoenix recovery planning for BCT"
+
+[lib]
+name = "bct_phoenix_kernel"
+path = "src/lib.rs"
+
+[dependencies]

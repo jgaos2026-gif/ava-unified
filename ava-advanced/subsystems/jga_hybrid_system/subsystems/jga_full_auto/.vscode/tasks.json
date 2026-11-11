@@ -1,0 +1,1 @@
+{"tasks":[{"command":"py -m pip install -r requirements.txt","label":"Install deps","problemMatcher":[],"type":"shell"},{"command":"python -m unittest discover -s tests -v","label":"Run tests","problemMatcher":[],"type":"shell"},{"command":"python main.py --demo","label":"Run demo","problemMatcher":[],"type":"shell"}],"version":"2.0.0"}
