@@ -59,3 +59,7 @@ the code; run them before trusting a claim.
 
 See `ava-merged/README.md`. Python 3.12, `pip install -r ava-merged/requirements.txt`.
 Supply your own keys via environment variables — never commit a real one.
+
+## SB688 pre-brain gate deployment
+
+AVA `/orchestrate` now requires a successful authenticated call to the real SB688 TypeScript SpineGovernor and LiquidTruthNodeMesh before the brain is called. Configure `SB688_RUNTIME_URL` and `SB688_GATE_SHARED_SECRET` on AVA, and configure the same shared secret, durable Ed25519 signing keys, and a persistent `SB688_PERMIT_REPLAY_STORE_PATH` on SB688. Missing configuration intentionally blocks orchestration. See [`AVA_SB688_GATE_DEPLOYMENT.md`](AVA_SB688_GATE_DEPLOYMENT.md). Unit tests mock the service boundary; complete the documented cross-service staging acceptance test before production use.
